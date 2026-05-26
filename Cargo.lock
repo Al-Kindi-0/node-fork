@@ -3335,6 +3335,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "miden-node-private-tx"
+version = "0.15.0"
+dependencies = [
+ "miden-crypto",
+ "miden-protocol",
+ "rand 0.9.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "miden-node-proto"
 version = "0.15.0"
 dependencies = [

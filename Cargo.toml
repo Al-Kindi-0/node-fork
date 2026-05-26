@@ -12,6 +12,7 @@ members = [
   "crates/grpc-error-macro",
   "crates/large-smt-backend-rocksdb",
   "crates/proto",
+  "crates/private-tx",
   "crates/remote-prover-client",
   "crates/rocksdb-cxx-linkage-fix",
   "crates/rpc",
@@ -49,6 +50,7 @@ miden-node-block-producer       = { path = "crates/block-producer", version = "0
 miden-node-db                   = { path = "crates/db", version = "0.15" }
 miden-node-grpc-error-macro     = { path = "crates/grpc-error-macro", version = "0.15" }
 miden-node-proto                = { path = "crates/proto", version = "0.15" }
+miden-node-private-tx           = { path = "crates/private-tx", version = "0.15" }
 miden-node-proto-build          = { path = "proto", version = "0.15" }
 miden-node-rpc                  = { path = "crates/rpc", version = "0.15" }
 miden-node-store                = { path = "crates/store", version = "0.15" }

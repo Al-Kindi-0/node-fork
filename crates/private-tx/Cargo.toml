@@ -1,0 +1,27 @@
+[package]
+authors.workspace      = true
+description            = "Private validator transaction envelope helpers for Miden node"
+edition.workspace      = true
+homepage.workspace     = true
+keywords               = ["miden", "node", "private-validator"]
+license.workspace      = true
+name                   = "miden-node-private-tx"
+readme                 = "README.md"
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[features]
+default = []
+
+[dependencies]
+miden-crypto   = { workspace = true }
+miden-protocol = { workspace = true }
+rand           = { workspace = true }
+thiserror      = { workspace = true }
