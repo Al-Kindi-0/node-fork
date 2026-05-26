@@ -65,7 +65,6 @@ pub(crate) fn insert_transaction(
 /// Inserts an encrypted private transaction archive record.
 ///
 /// Existing records are left unchanged so repeated transaction submission stays idempotent.
-#[allow(dead_code)] // Used once validator archive integration is wired.
 #[instrument(target = COMPONENT, skip_all, fields(tx_id = %record.tx_id), err)]
 pub(crate) fn insert_private_tx_archive_record(
     conn: &mut SqliteConnection,

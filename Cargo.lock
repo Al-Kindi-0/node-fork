@@ -4221,6 +4221,7 @@ dependencies = [
  "hex",
  "miden-node-db",
  "miden-node-private-tx",
+ "miden-node-private-tx-golden",
  "miden-node-proto",
  "miden-node-proto-build",
  "miden-node-store",

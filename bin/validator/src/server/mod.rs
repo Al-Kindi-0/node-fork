@@ -7,12 +7,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use anyhow::Context;
 use miden_node_db::Db;
-use miden_node_private_tx::{ChainId, ValidatorId};
+use miden_node_private_tx::{
+    ChainId, ThresholdRecordEncryptor, ValidatorId, ViewingGroupPublicKey,
+};
 use miden_node_proto::generated::validator::api_server;
 use miden_node_proto_build::validator_api_descriptor;
 use miden_node_utils::clap::GrpcOptionsInternal;
 use miden_node_utils::panic::catch_panic_layer_fn;
 use miden_node_utils::tracing::grpc::grpc_trace_fn;
+use miden_protocol::Word;
 use miden_protocol::crypto::ies::UnsealingKey;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -21,10 +24,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::db::{
-    count_signed_blocks,
-    count_validated_transactions,
-    load_chain_tip,
-    load_with_pool_size,
+    count_signed_blocks, count_validated_transactions, load_chain_tip, load_with_pool_size,
 };
 use crate::{COMPONENT, ValidatorSigner};
 
@@ -122,7 +122,7 @@ impl Validator {
 pub enum PrivateTxSubmissionConfig {
     /// Require clear transaction inputs and reject encrypted private payloads.
     Public,
-    /// Accept encrypted private payloads and decrypt them with this validator key.
+    /// Accept encrypted private payloads, decrypt them, and archive their private inputs.
     Private {
         /// Chain ID bound into the encrypted submission associated data.
         chain_id: ChainId,
@@ -130,18 +130,44 @@ pub enum PrivateTxSubmissionConfig {
         validator_id: ValidatorId,
         /// Validator private key used to decrypt submitted private payloads.
         unsealing_key: UnsealingKey,
+        /// Archive configuration used after validation succeeds.
+        archive: PrivateTxArchiveConfig,
     },
+}
+
+/// Configuration for encrypted private transaction archive records.
+#[derive(Clone)]
+pub struct PrivateTxArchiveConfig {
+    /// TEE attestation id bound into archive associated data.
+    ///
+    /// PoC configuration stand-in until real TEE attestation is wired.
+    pub tee_attestation_id: Word,
+    /// Threshold viewing group public key used to wrap archive record keys.
+    pub viewing_group_public_key: ViewingGroupPublicKey,
+    /// Threshold encryptor used to wrap per-transaction archive record keys.
+    pub record_key_encryptor: Arc<dyn ThresholdRecordEncryptor + Send + Sync>,
+}
+
+impl fmt::Debug for PrivateTxArchiveConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateTxArchiveConfig")
+            .field("tee_attestation_id", &self.tee_attestation_id)
+            .field("viewing_group_id", &self.viewing_group_public_key.viewing_group_id)
+            .field("record_key_encryptor", &"<threshold encryptor>")
+            .finish()
+    }
 }
 
 impl fmt::Debug for PrivateTxSubmissionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Public => f.write_str("Public"),
-            Self::Private { chain_id, validator_id, .. } => f
+            Self::Private { chain_id, validator_id, archive, .. } => f
                 .debug_struct("Private")
                 .field("chain_id", chain_id)
                 .field("validator_id", validator_id)
                 .field("unsealing_key", &"<redacted>")
+                .field("archive", archive)
                 .finish(),
         }
     }
@@ -175,16 +201,55 @@ impl fmt::Debug for PrivateTxPayloadDecryptor {
     }
 }
 
+pub(crate) struct PrivateTxArchiveWriter {
+    chain_id: ChainId,
+    validator_id: ValidatorId,
+    tee_attestation_id: Word,
+    viewing_group_public_key: ViewingGroupPublicKey,
+    record_key_encryptor: Arc<dyn ThresholdRecordEncryptor + Send + Sync>,
+}
+
+impl PrivateTxArchiveWriter {
+    fn new(chain_id: ChainId, validator_id: ValidatorId, archive: PrivateTxArchiveConfig) -> Self {
+        Self {
+            chain_id,
+            validator_id,
+            tee_attestation_id: archive.tee_attestation_id,
+            viewing_group_public_key: archive.viewing_group_public_key,
+            record_key_encryptor: archive.record_key_encryptor,
+        }
+    }
+}
+
+impl fmt::Debug for PrivateTxArchiveWriter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateTxArchiveWriter")
+            .field("chain_id", &self.chain_id)
+            .field("validator_id", &self.validator_id)
+            .field("tee_attestation_id", &self.tee_attestation_id)
+            .field("viewing_group_id", &self.viewing_group_public_key.viewing_group_id)
+            .field("record_key_encryptor", &"<threshold encryptor>")
+            .finish()
+    }
+}
+
 pub(crate) enum PrivateTxSubmissionMode {
     Public,
-    Private(PrivateTxPayloadDecryptor),
+    Private {
+        decryptor: PrivateTxPayloadDecryptor,
+        archive_writer: PrivateTxArchiveWriter,
+    },
 }
 
 impl fmt::Debug for PrivateTxSubmissionMode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Public => f.write_str("Public"),
-            Self::Private(decryptor) => f.debug_tuple("Private").field(decryptor).finish(),
+            Self::Private { decryptor, archive_writer } => f
+                .debug_struct("Private")
+                .field("decryptor", decryptor)
+                .field("archive_writer", archive_writer)
+                .finish(),
         }
     }
 }
@@ -197,11 +262,15 @@ impl From<PrivateTxSubmissionConfig> for PrivateTxSubmissionMode {
                 chain_id,
                 validator_id,
                 unsealing_key,
-            } => Self::Private(PrivateTxPayloadDecryptor::new(
-                chain_id,
-                validator_id,
-                unsealing_key,
-            )),
+                archive,
+            } => Self::Private {
+                decryptor: PrivateTxPayloadDecryptor::new(
+                    chain_id.clone(),
+                    validator_id.clone(),
+                    unsealing_key,
+                ),
+                archive_writer: PrivateTxArchiveWriter::new(chain_id, validator_id, archive),
+            },
         }
     }
 }

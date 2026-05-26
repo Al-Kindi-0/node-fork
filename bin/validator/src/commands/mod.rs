@@ -3,15 +3,18 @@ mod start;
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::Parser;
-use miden_node_private_tx::{ChainId, ValidatorId};
+use miden_node_private_tx::{ChainId, ValidatorId, ViewingGroupPublicKey};
+use miden_node_private_tx_golden::GoldenThresholdAdapter;
 use miden_node_utils::clap::GrpcOptionsInternal;
+use miden_protocol::Word;
 use miden_protocol::crypto::dsa::ecdsa_k256_keccak::SecretKey;
 use miden_protocol::crypto::ies::{IesScheme, UnsealingKey};
 use miden_protocol::utils::serde::Deserializable;
-use miden_validator::{PrivateTxSubmissionConfig, ValidatorSigner};
+use miden_validator::{PrivateTxArchiveConfig, PrivateTxSubmissionConfig, ValidatorSigner};
 
 const ENV_DATA_DIRECTORY: &str = "MIDEN_NODE_DATA_DIRECTORY";
 const ENV_LISTEN: &str = "MIDEN_NODE_VALIDATOR_LISTEN";
@@ -24,6 +27,10 @@ const ENV_PRIVATE_TX_CHAIN_ID: &str = "MIDEN_NODE_VALIDATOR_PRIVATE_TX_CHAIN_ID"
 const ENV_PRIVATE_TX_VALIDATOR_ID: &str = "MIDEN_NODE_VALIDATOR_PRIVATE_TX_VALIDATOR_ID";
 const ENV_PRIVATE_TX_UNSEALING_KEY_FILE: &str =
     "MIDEN_NODE_VALIDATOR_PRIVATE_TX_UNSEALING_KEY_FILE";
+const ENV_PRIVATE_TX_TEE_ATTESTATION_ID: &str =
+    "MIDEN_NODE_VALIDATOR_PRIVATE_TX_TEE_ATTESTATION_ID";
+const ENV_PRIVATE_TX_VIEWING_GROUP_PUBLIC_KEY_FILE: &str =
+    "MIDEN_NODE_VALIDATOR_PRIVATE_TX_VIEWING_GROUP_PUBLIC_KEY_FILE";
 
 /// A predefined, insecure validator key for development purposes.
 pub(crate) const INSECURE_KEY_HEX: &str =
@@ -219,13 +226,41 @@ pub struct PrivateTxConfig {
         value_name = "FILE"
     )]
     unsealing_key_file: Option<PathBuf>,
+
+    /// TEE attestation ID to bind encrypted archive records to.
+    #[arg(
+        long = "private-tx.tee-attestation-id",
+        env = ENV_PRIVATE_TX_TEE_ATTESTATION_ID,
+        value_name = "WORD"
+    )]
+    tee_attestation_id: Option<String>,
+
+    /// File containing the Miden-serialized threshold viewing group public key.
+    #[arg(
+        long = "private-tx.viewing-group-public-key-file",
+        env = ENV_PRIVATE_TX_VIEWING_GROUP_PUBLIC_KEY_FILE,
+        value_name = "FILE"
+    )]
+    viewing_group_public_key_file: Option<PathBuf>,
 }
 
 impl PrivateTxConfig {
     fn into_submission_config(self) -> anyhow::Result<PrivateTxSubmissionConfig> {
-        match (self.chain_id, self.validator_id, self.unsealing_key_file) {
-            (None, None, None) => Ok(PrivateTxSubmissionConfig::Public),
-            (Some(chain_id), Some(validator_id), Some(unsealing_key_file)) => {
+        match (
+            self.chain_id,
+            self.validator_id,
+            self.unsealing_key_file,
+            self.tee_attestation_id,
+            self.viewing_group_public_key_file,
+        ) {
+            (None, None, None, None, None) => Ok(PrivateTxSubmissionConfig::Public),
+            (
+                Some(chain_id),
+                Some(validator_id),
+                Some(unsealing_key_file),
+                Some(tee_attestation_id),
+                Some(viewing_group_public_key_file),
+            ) => {
                 let chain_id = ChainId::new(chain_id)?;
                 let validator_id = ValidatorId::new(validator_id)?;
                 let bytes = fs_err::read(&unsealing_key_file).with_context(|| {
@@ -247,19 +282,46 @@ impl PrivateTxConfig {
                         unsealing_key.scheme()
                     );
                 }
+                let tee_attestation_id = parse_word(&tee_attestation_id).with_context(|| {
+                    format!("failed to parse private tx tee attestation id {tee_attestation_id}")
+                })?;
+                let bytes = fs_err::read(&viewing_group_public_key_file).with_context(|| {
+                    format!(
+                        "failed to read private tx viewing group public key file {}",
+                        viewing_group_public_key_file.display()
+                    )
+                })?;
+                let viewing_group_public_key = ViewingGroupPublicKey::read_from_bytes(&bytes)
+                    .with_context(|| {
+                        format!(
+                            "failed to parse private tx viewing group public key from {}",
+                            viewing_group_public_key_file.display()
+                        )
+                    })?;
 
                 Ok(PrivateTxSubmissionConfig::Private {
                     chain_id,
                     validator_id,
                     unsealing_key,
+                    archive: PrivateTxArchiveConfig {
+                        tee_attestation_id,
+                        viewing_group_public_key,
+                        record_key_encryptor: Arc::new(GoldenThresholdAdapter),
+                    },
                 })
             },
             _ => bail!(
                 "private tx mode requires --private-tx.chain-id, \
-                 --private-tx.validator-id, and --private-tx.unsealing-key-file"
+                 --private-tx.validator-id, --private-tx.unsealing-key-file, \
+                 --private-tx.tee-attestation-id, and \
+                 --private-tx.viewing-group-public-key-file"
             ),
         }
     }
+}
+
+fn parse_word(value: &str) -> anyhow::Result<Word> {
+    Word::parse(value).map_err(|err| anyhow!("{err}"))
 }
 
 // VALIDATOR KEY
@@ -326,6 +388,8 @@ mod tests {
             chain_id: Some("miden-devnet".to_string()),
             validator_id: None,
             unsealing_key_file: None,
+            tee_attestation_id: None,
+            viewing_group_public_key_file: None,
         };
 
         let err = config.into_submission_config().unwrap_err();
@@ -333,15 +397,20 @@ mod tests {
         assert!(err.to_string().contains("--private-tx.chain-id"));
         assert!(err.to_string().contains("--private-tx.validator-id"));
         assert!(err.to_string().contains("--private-tx.unsealing-key-file"));
+        assert!(err.to_string().contains("--private-tx.tee-attestation-id"));
+        assert!(err.to_string().contains("--private-tx.viewing-group-public-key-file"));
     }
 
     #[test]
-    fn private_tx_config_loads_unsealing_key_file() {
+    fn private_tx_config_loads_private_mode_files() {
         let temp_dir = tempfile::tempdir().unwrap();
         let key_path = temp_dir.path().join("unsealing.key");
+        let viewing_group_path = temp_dir.path().join("viewing-group-pk");
         let key = UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new());
         fs_err::write(&key_path, key.to_bytes()).unwrap();
-        let config = private_tx_config_with_key_path(key_path);
+        let viewing_group_public_key = viewing_group_public_key();
+        fs_err::write(&viewing_group_path, viewing_group_public_key.to_bytes()).unwrap();
+        let config = private_tx_config_with_paths(key_path, viewing_group_path);
 
         let config = config.into_submission_config().unwrap();
 
@@ -349,6 +418,7 @@ mod tests {
             chain_id,
             validator_id,
             unsealing_key,
+            archive,
         } = config
         else {
             panic!("expected private mode config");
@@ -356,13 +426,16 @@ mod tests {
         assert_eq!(chain_id.as_str(), "miden-devnet");
         assert_eq!(validator_id.as_str(), "validator-1");
         assert_eq!(unsealing_key.scheme(), IesScheme::X25519XChaCha20Poly1305);
+        assert_eq!(archive.tee_attestation_id, word(7));
+        assert_eq!(archive.viewing_group_public_key, viewing_group_public_key);
     }
 
     #[test]
     fn private_tx_config_rejects_missing_unsealing_key_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let key_path = temp_dir.path().join("missing.key");
-        let config = private_tx_config_with_key_path(key_path.clone());
+        let viewing_group_path = temp_dir.path().join("viewing-group-pk");
+        let config = private_tx_config_with_paths(key_path.clone(), viewing_group_path);
 
         let err = config.into_submission_config().unwrap_err();
         let message = err.to_string();
@@ -376,7 +449,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let key_path = temp_dir.path().join("malformed.key");
         fs_err::write(&key_path, b"not-a-key").unwrap();
-        let config = private_tx_config_with_key_path(key_path.clone());
+        let viewing_group_path = temp_dir.path().join("viewing-group-pk");
+        let config = private_tx_config_with_paths(key_path.clone(), viewing_group_path);
 
         let err = config.into_submission_config().unwrap_err();
         let message = err.to_string();
@@ -391,7 +465,8 @@ mod tests {
         let key_path = temp_dir.path().join("k256.key");
         let key = UnsealingKey::K256XChaCha20Poly1305(K256SecretKey::new());
         fs_err::write(&key_path, key.to_bytes()).unwrap();
-        let config = private_tx_config_with_key_path(key_path);
+        let viewing_group_path = temp_dir.path().join("viewing-group-pk");
+        let config = private_tx_config_with_paths(key_path, viewing_group_path);
 
         let err = config.into_submission_config().unwrap_err();
         let message = err.to_string();
@@ -401,11 +476,44 @@ mod tests {
         assert!(message.contains("K256+XChaCha20-Poly1305"));
     }
 
-    fn private_tx_config_with_key_path(key_path: PathBuf) -> PrivateTxConfig {
+    #[test]
+    fn private_tx_config_rejects_malformed_viewing_group_public_key_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("unsealing.key");
+        let viewing_group_path = temp_dir.path().join("malformed-viewing-group-pk");
+        let key = UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new());
+        fs_err::write(&key_path, key.to_bytes()).unwrap();
+        fs_err::write(&viewing_group_path, b"not-a-viewing-group-public-key").unwrap();
+        let config = private_tx_config_with_paths(key_path, viewing_group_path.clone());
+
+        let err = config.into_submission_config().unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("failed to parse private tx viewing group public key"));
+        assert!(message.contains(&viewing_group_path.display().to_string()));
+    }
+
+    fn private_tx_config_with_paths(
+        key_path: PathBuf,
+        viewing_group_path: PathBuf,
+    ) -> PrivateTxConfig {
         PrivateTxConfig {
             chain_id: Some("miden-devnet".to_string()),
             validator_id: Some("validator-1".to_string()),
             unsealing_key_file: Some(key_path),
+            tee_attestation_id: Some(word(7).to_hex()),
+            viewing_group_public_key_file: Some(viewing_group_path),
         }
+    }
+
+    fn viewing_group_public_key() -> ViewingGroupPublicKey {
+        ViewingGroupPublicKey {
+            viewing_group_id: word(20),
+            bytes: b"viewing-group-public-key".to_vec(),
+        }
+    }
+
+    fn word(seed: u32) -> Word {
+        Word::from([seed, seed + 1, seed + 2, seed + 3])
     }
 }

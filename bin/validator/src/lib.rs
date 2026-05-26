@@ -4,7 +4,7 @@ mod server;
 mod signers;
 mod tx_validation;
 
-pub use server::{PrivateTxSubmissionConfig, Validator};
+pub use server::{PrivateTxArchiveConfig, PrivateTxSubmissionConfig, Validator};
 pub use signers::{KmsSigner, ValidatorSigner};
 
 // CONSTANTS
