@@ -26,3 +26,15 @@ verifier or a patched vendor crate.
 - Record-key wrapping and audit recovery use golden-rs vetKeys IBE.
 - Wire bytes are domain-separated, versioned, and serialized by this crate rather than exposing
   golden-rs structs directly.
+
+## Demo
+
+Run the in-process PoC flow:
+
+```bash
+cargo run -p miden-node-private-tx-golden --example private_validator_demo
+```
+
+The example runs the happy path and prints basic payload sizes and wall-clock timings for DKG,
+client encryption, validator archive creation, and audit decryption. Timings can increase if the
+PoC batch-proof compatibility fallback in `compat.rs` is exercised.
