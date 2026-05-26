@@ -15,11 +15,12 @@ use crate::tee::{
     AttestationEvidence, AttestationVerifier, EnclaveIdentity, TeeError, TeeKeyProvider,
 };
 use crate::threshold::{
-    AuditTransportPublicKey, AuditTransportSecret, DecryptionResponse, DkgDealingBytes,
-    DkgParticipant, DkgSession, RecordKeyUnlockMaterial, ThresholdError, ThresholdRecordEncryptor,
-    ThresholdShareCombiner, ThresholdShareProducer, ThresholdShareVerifier, ViewingGroupPublicKey,
-    ViewingGroupSetup, ViewingKeyShare, ViewingPartyPublicShare, validate_dkg_session,
-    validate_threshold, validate_viewing_parties,
+    AuditTransportPublicKey, AuditTransportSecret, DecryptionResponse, DkgDealing,
+    DkgLocalParticipant, DkgParticipant, DkgPrivateDealing, DkgPublicDealing, DkgSession,
+    RecordKeyUnlockMaterial, ThresholdError, ThresholdRecordEncryptor, ThresholdShareCombiner,
+    ThresholdShareProducer, ThresholdShareVerifier, ViewingGroupPublicKey, ViewingGroupSetup,
+    ViewingKeyShare, ViewingPartyPublicShare, validate_dkg_session, validate_threshold,
+    validate_viewing_parties,
 };
 use crate::types::{TeeSchemeId, ThresholdSchemeId, ValidatorId};
 
@@ -159,26 +160,38 @@ impl ViewingGroupSetup for MockThresholdAdapter {
     fn create_dkg_dealing(
         &self,
         session: &DkgSession,
-        participant: &DkgParticipant,
-    ) -> Result<DkgDealingBytes, ThresholdError> {
-        ensure_participant(session, participant)?;
+        participant: &DkgLocalParticipant,
+    ) -> Result<DkgDealing, ThresholdError> {
+        ensure_participant(session, &participant.public)?;
 
-        let mut bytes = Vec::new();
-        session.viewing_group_id().write_into(&mut bytes);
-        participant.party_id.write_into(&mut bytes);
-        participant.public_key.write_into(&mut bytes);
-        session.session_id().write_into(&mut bytes);
+        let mut public_bytes = Vec::new();
+        session.viewing_group_id().write_into(&mut public_bytes);
+        participant.public.party_id.write_into(&mut public_bytes);
+        participant.public.public_key.write_into(&mut public_bytes);
+        session.session_id().write_into(&mut public_bytes);
 
-        Ok(DkgDealingBytes {
-            party_id: participant.party_id.clone(),
-            bytes,
-        })
+        let mut private_bytes = Vec::new();
+        session.viewing_group_id().write_into(&mut private_bytes);
+        participant.public.party_id.write_into(&mut private_bytes);
+        participant.secret.write_into(&mut private_bytes);
+        session.session_id().write_into(&mut private_bytes);
+
+        DkgDealing::new(
+            DkgPublicDealing {
+                party_id: participant.public.party_id.clone(),
+                bytes: public_bytes,
+            },
+            DkgPrivateDealing {
+                party_id: participant.public.party_id.clone(),
+                bytes: private_bytes,
+            },
+        )
     }
 
     fn verify_dkg_dealing(
         &self,
         session: &DkgSession,
-        dealing: &DkgDealingBytes,
+        dealing: &DkgPublicDealing,
     ) -> Result<(), ThresholdError> {
         validate_dkg_session(session)?;
         if !session
@@ -197,22 +210,26 @@ impl ViewingGroupSetup for MockThresholdAdapter {
     fn complete_dkg(
         &self,
         session: &DkgSession,
-        participant: &DkgParticipant,
-        own_dealing: &DkgDealingBytes,
-        peer_dealings: &[DkgDealingBytes],
+        participant: &DkgLocalParticipant,
+        own_dealing: &DkgPrivateDealing,
+        peer_dealings: &[DkgPublicDealing],
     ) -> Result<ViewingKeyShare, ThresholdError> {
-        ensure_participant(session, participant)?;
-        self.verify_dkg_dealing(session, own_dealing)?;
+        ensure_participant(session, &participant.public)?;
+        // Private dealing state is local-only, so it gets a local consistency check instead of
+        // public dealing verification.
+        if own_dealing.party_id != participant.public.party_id || own_dealing.bytes.is_empty() {
+            return Err(ThresholdError::VerificationFailed);
+        }
         for dealing in peer_dealings {
             self.verify_dkg_dealing(session, dealing)?;
         }
 
         Ok(ViewingKeyShare {
             viewing_group_id: session.viewing_group_id(),
-            party_id: participant.party_id.clone(),
+            party_id: participant.public.party_id.clone(),
             bytes: prefixed_bytes(
                 b"mock-completed-dkg-share",
-                participant.party_id.as_str().as_bytes(),
+                participant.public.party_id.as_str().as_bytes(),
             ),
         })
     }
@@ -312,6 +329,7 @@ impl ThresholdShareVerifier for MockThresholdAdapter {
 impl ThresholdShareCombiner for MockThresholdAdapter {
     fn combine_responses(
         &self,
+        data_key_protection: &DataKeyProtection,
         responses: &[DecryptionResponse],
         threshold: u16,
         identity: &[u8],
@@ -328,13 +346,24 @@ impl ThresholdShareCombiner for MockThresholdAdapter {
             return Err(ThresholdError::InsufficientResponses);
         }
 
-        let first = responses.first().ok_or(ThresholdError::InsufficientResponses)?;
-        let response_bytes = read_mock_response_bytes(&first.bytes)?;
-        if response_bytes.transport_key != request_transport_secret.bytes {
-            return Err(ThresholdError::VerificationFailed);
+        let wrapped_key = extract_mock_wrapped_key(data_key_protection)?;
+        let expected_wrapped_key = data_key_protection.to_bytes();
+        for response in responses {
+            if response.identity != identity {
+                return Err(ThresholdError::IdentityMismatch);
+            }
+            if response.viewing_group_id != wrapped_key.viewing_group_id {
+                return Err(ThresholdError::ViewingGroupMismatch);
+            }
+            let response_bytes = read_mock_response_bytes(&response.bytes)?;
+            if response_bytes.transport_key != request_transport_secret.bytes {
+                return Err(ThresholdError::VerificationFailed);
+            }
+            if response_bytes.wrapped_key != expected_wrapped_key {
+                return Err(ThresholdError::VerificationFailed);
+            }
         }
 
-        let wrapped_key = extract_mock_wrapped_key_from_bytes(&response_bytes.wrapped_key)?;
         if wrapped_key.identity != identity {
             return Err(ThresholdError::IdentityMismatch);
         }
@@ -506,6 +535,16 @@ mod tests {
         }
     }
 
+    fn local_participant(id: &str) -> DkgLocalParticipant {
+        DkgLocalParticipant {
+            public: DkgParticipant {
+                party_id: crate::types::ViewingPartyId::new(id).unwrap(),
+                public_key: format!("{id}-public-key").into_bytes(),
+            },
+            secret: format!("{id}-secret").into_bytes(),
+        }
+    }
+
     #[test]
     fn mock_tee_attests_and_verifies_identity() {
         let validator_id = ValidatorId::new("validator-1").unwrap();
@@ -544,6 +583,42 @@ mod tests {
             MockThresholdAdapter::bootstrap_viewing_group(&policy).unwrap_err(),
             ThresholdError::DuplicateParticipant
         );
+    }
+
+    #[test]
+    fn mock_dkg_uses_public_and_private_dealing_state() {
+        let participants = vec![
+            local_participant("party-1"),
+            local_participant("party-2"),
+            local_participant("party-3"),
+        ];
+        let session = DkgSession::new(
+            word(101),
+            2,
+            participants.iter().map(|participant| participant.public.clone()).collect(),
+        )
+        .unwrap();
+        let adapter = MockThresholdAdapter;
+        let dealings = participants
+            .iter()
+            .map(|participant| adapter.create_dkg_dealing(&session, participant).unwrap())
+            .collect::<Vec<_>>();
+
+        for dealing in &dealings {
+            adapter.verify_dkg_dealing(&session, &dealing.public).unwrap();
+        }
+
+        let peer_dealings = dealings
+            .iter()
+            .skip(1)
+            .map(|dealing| dealing.public.clone())
+            .collect::<Vec<_>>();
+        let key_share = adapter
+            .complete_dkg(&session, &participants[0], &dealings[0].private, &peer_dealings)
+            .unwrap();
+
+        assert_eq!(key_share.party_id, participants[0].public.party_id);
+        assert_eq!(key_share.viewing_group_id, session.viewing_group_id());
     }
 
     #[test]
@@ -591,6 +666,7 @@ mod tests {
 
         let unlock = adapter
             .combine_responses(
+                &protection,
                 &responses,
                 policy.threshold,
                 identity,
@@ -604,6 +680,7 @@ mod tests {
         assert_eq!(
             adapter
                 .combine_responses(
+                    &protection,
                     one_response,
                     policy.threshold,
                     identity,
@@ -616,6 +693,7 @@ mod tests {
         assert_eq!(
             adapter
                 .combine_responses(
+                    &protection,
                     &responses,
                     policy.threshold,
                     identity,
@@ -624,6 +702,23 @@ mod tests {
                 )
                 .unwrap_err(),
             ThresholdError::AssociatedDataMismatch
+        );
+
+        let other_protection = adapter
+            .encrypt_record_key(&group_public_key, identity, associated_data, b"other-record-key")
+            .unwrap();
+        assert_eq!(
+            adapter
+                .combine_responses(
+                    &other_protection,
+                    &responses,
+                    policy.threshold,
+                    identity,
+                    associated_data,
+                    &transport_secret,
+                )
+                .unwrap_err(),
+            ThresholdError::VerificationFailed
         );
     }
 }

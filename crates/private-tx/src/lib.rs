@@ -34,11 +34,11 @@ pub use tee::{
     AttestationEvidence, AttestationVerifier, Attestor, EnclaveIdentity, TeeError, TeeKeyProvider,
 };
 pub use threshold::{
-    AuditTransportPublicKey, AuditTransportSecret, DecryptionResponse, DkgDealingBytes,
-    DkgParticipant, DkgSession, RecordKeyUnlockMaterial, ThresholdBackend, ThresholdError,
-    ThresholdRecordEncryptor, ThresholdShareCombiner, ThresholdShareProducer,
-    ThresholdShareVerifier, ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare,
-    ViewingPartyPublicShare,
+    AuditTransportPublicKey, AuditTransportSecret, DecryptionResponse, DkgDealing,
+    DkgLocalParticipant, DkgParticipant, DkgPrivateDealing, DkgPublicDealing, DkgSession,
+    RecordKeyUnlockMaterial, ThresholdBackend, ThresholdError, ThresholdRecordEncryptor,
+    ThresholdShareCombiner, ThresholdShareProducer, ThresholdShareVerifier, ViewingGroupPublicKey,
+    ViewingGroupSetup, ViewingKeyShare, ViewingPartyPublicShare,
 };
 pub use types::{
     ChainId, EncryptionSchemeId, PRIVATE_TX_VERSION, TeeSchemeId, ThresholdSchemeId, ValidatorId,

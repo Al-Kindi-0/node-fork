@@ -148,6 +148,7 @@ fn audit_rejects_below_threshold_response_count() {
     assert_eq!(
         backend
             .combine_responses(
+                &archive.record.data_key_protection,
                 &one_response,
                 fixture.viewing_policy.threshold,
                 &archive.record.identity,
@@ -346,6 +347,7 @@ fn auditor_decrypts_archive<B: ThresholdBackend>(
 
     let unlock = backend
         .combine_responses(
+            &record.data_key_protection,
             &responses,
             viewing_group.threshold,
             &record.identity,

@@ -40,6 +40,21 @@ pub struct DkgParticipant {
     pub public_key: Vec<u8>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct DkgLocalParticipant {
+    pub public: DkgParticipant,
+    pub secret: Vec<u8>,
+}
+
+impl fmt::Debug for DkgLocalParticipant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DkgLocalParticipant")
+            .field("public", &self.public)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DkgSession {
     viewing_group_id: Word,
@@ -84,9 +99,43 @@ impl DkgSession {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DkgDealingBytes {
+pub struct DkgPublicDealing {
     pub party_id: ViewingPartyId,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DkgPrivateDealing {
+    pub party_id: ViewingPartyId,
+    pub bytes: Vec<u8>,
+}
+
+impl fmt::Debug for DkgPrivateDealing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DkgPrivateDealing")
+            .field("party_id", &self.party_id)
+            .field("bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DkgDealing {
+    pub public: DkgPublicDealing,
+    pub private: DkgPrivateDealing,
+}
+
+impl DkgDealing {
+    pub fn new(
+        public: DkgPublicDealing,
+        private: DkgPrivateDealing,
+    ) -> Result<Self, ThresholdError> {
+        if public.party_id != private.party_id {
+            return Err(ThresholdError::MalformedMaterial);
+        }
+
+        Ok(Self { public, private })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,21 +210,21 @@ pub trait ViewingGroupSetup {
     fn create_dkg_dealing(
         &self,
         session: &DkgSession,
-        participant: &DkgParticipant,
-    ) -> Result<DkgDealingBytes, ThresholdError>;
+        participant: &DkgLocalParticipant,
+    ) -> Result<DkgDealing, ThresholdError>;
 
     fn verify_dkg_dealing(
         &self,
         session: &DkgSession,
-        dealing: &DkgDealingBytes,
+        dealing: &DkgPublicDealing,
     ) -> Result<(), ThresholdError>;
 
     fn complete_dkg(
         &self,
         session: &DkgSession,
-        participant: &DkgParticipant,
-        own_dealing: &DkgDealingBytes,
-        peer_dealings: &[DkgDealingBytes],
+        participant: &DkgLocalParticipant,
+        own_dealing: &DkgPrivateDealing,
+        peer_dealings: &[DkgPublicDealing],
     ) -> Result<ViewingKeyShare, ThresholdError>;
 }
 
@@ -214,6 +263,7 @@ pub trait ThresholdShareVerifier {
 pub trait ThresholdShareCombiner {
     fn combine_responses(
         &self,
+        data_key_protection: &DataKeyProtection,
         responses: &[DecryptionResponse],
         threshold: u16,
         identity: &[u8],
@@ -326,6 +376,22 @@ impl Deserializable for DkgParticipant {
     }
 }
 
+impl Serializable for DkgLocalParticipant {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.public.write_into(target);
+        self.secret.write_into(target);
+    }
+}
+
+impl Deserializable for DkgLocalParticipant {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        Ok(Self {
+            public: source.read()?,
+            secret: source.read()?,
+        })
+    }
+}
+
 impl Serializable for DkgSession {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         self.viewing_group_id.write_into(target);
@@ -360,19 +426,51 @@ impl Deserializable for DkgSession {
     }
 }
 
-impl Serializable for DkgDealingBytes {
+impl Serializable for DkgPublicDealing {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         self.party_id.write_into(target);
         self.bytes.write_into(target);
     }
 }
 
-impl Deserializable for DkgDealingBytes {
+impl Deserializable for DkgPublicDealing {
     fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
         Ok(Self {
             party_id: source.read()?,
             bytes: source.read()?,
         })
+    }
+}
+
+impl Serializable for DkgPrivateDealing {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.party_id.write_into(target);
+        self.bytes.write_into(target);
+    }
+}
+
+impl Deserializable for DkgPrivateDealing {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        Ok(Self {
+            party_id: source.read()?,
+            bytes: source.read()?,
+        })
+    }
+}
+
+impl Serializable for DkgDealing {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.public.write_into(target);
+        self.private.write_into(target);
+    }
+}
+
+impl Deserializable for DkgDealing {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        let public: DkgPublicDealing = source.read()?;
+        let private: DkgPrivateDealing = source.read()?;
+        DkgDealing::new(public, private)
+            .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
     }
 }
 
@@ -538,7 +636,40 @@ mod tests {
     }
 
     #[test]
+    fn dkg_dealing_deserialization_rejects_mismatched_party_ids() {
+        let public = DkgPublicDealing {
+            party_id: ViewingPartyId::new("party-1").unwrap(),
+            bytes: b"public".to_vec(),
+        };
+        let private = DkgPrivateDealing {
+            party_id: ViewingPartyId::new("party-2").unwrap(),
+            bytes: b"private".to_vec(),
+        };
+        assert_eq!(
+            DkgDealing::new(public.clone(), private.clone()).unwrap_err(),
+            ThresholdError::MalformedMaterial
+        );
+
+        let mut bytes = Vec::new();
+        public.write_into(&mut bytes);
+        private.write_into(&mut bytes);
+
+        assert!(matches!(
+            DkgDealing::read_from_bytes(&bytes),
+            Err(DeserializationError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
     fn secret_threshold_material_has_redacted_debug() {
+        let local_participant = DkgLocalParticipant {
+            public: participant("party-1"),
+            secret: b"participant-secret".to_vec(),
+        };
+        let private_dealing = DkgPrivateDealing {
+            party_id: ViewingPartyId::new("party-1").unwrap(),
+            bytes: b"private-dealing".to_vec(),
+        };
         let share = ViewingKeyShare {
             viewing_group_id: word(1),
             party_id: ViewingPartyId::new("party-1").unwrap(),
@@ -547,6 +678,8 @@ mod tests {
         let transport_secret = AuditTransportSecret { bytes: b"transport-secret".to_vec() };
         let unlock = RecordKeyUnlockMaterial { record_key: b"record-key".to_vec() };
 
+        assert!(!format!("{local_participant:?}").contains("participant-secret"));
+        assert!(!format!("{private_dealing:?}").contains("private-dealing"));
         assert!(!format!("{share:?}").contains("secret-share"));
         assert!(!format!("{transport_secret:?}").contains("transport-secret"));
         assert!(!format!("{unlock:?}").contains("record-key"));
