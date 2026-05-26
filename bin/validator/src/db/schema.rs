@@ -8,6 +8,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    private_tx_archive_records (tx_id) {
+        tx_id -> Binary,
+        record -> Binary,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
     validated_transactions (id) {
         id -> Binary,
         block_num -> BigInt,
@@ -21,4 +29,8 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(block_headers, validated_transactions,);
+diesel::allow_tables_to_appear_in_same_query!(
+    block_headers,
+    private_tx_archive_records,
+    validated_transactions,
+);

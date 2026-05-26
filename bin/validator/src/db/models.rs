@@ -1,5 +1,6 @@
 use diesel::prelude::*;
 use miden_node_db::SqlTypeConvert;
+use miden_node_private_tx::EncryptedPrivateTxRecord;
 use miden_protocol::utils::serde::Serializable;
 
 use crate::db::schema;
@@ -11,6 +12,23 @@ use crate::tx_validation::ValidatedTransaction;
 pub struct BlockHeaderRowInsert {
     pub block_num: i64,
     pub block_header: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Insertable)]
+#[diesel(table_name = schema::private_tx_archive_records)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrivateTxArchiveRecordRowInsert {
+    pub tx_id: Vec<u8>,
+    pub record: Vec<u8>,
+}
+
+impl PrivateTxArchiveRecordRowInsert {
+    pub fn new(record: &EncryptedPrivateTxRecord) -> Self {
+        Self {
+            tx_id: record.tx_id.to_bytes(),
+            record: record.to_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Insertable)]

@@ -9,6 +9,7 @@ use diesel::SqliteConnection;
 use diesel::dsl::{count_star, exists};
 use diesel::prelude::*;
 use miden_node_db::{DatabaseError, Db, SqlTypeConvert};
+use miden_node_private_tx::EncryptedPrivateTxRecord;
 use miden_protocol::block::{BlockHeader, BlockNumber};
 use miden_protocol::transaction::TransactionId;
 use miden_protocol::utils::serde::{Deserializable, Serializable};
@@ -16,7 +17,11 @@ use tracing::instrument;
 
 use crate::COMPONENT;
 use crate::db::migrations::apply_migrations;
-use crate::db::models::{BlockHeaderRowInsert, ValidatedTransactionRowInsert};
+use crate::db::models::{
+    BlockHeaderRowInsert,
+    PrivateTxArchiveRecordRowInsert,
+    ValidatedTransactionRowInsert,
+};
 use crate::tx_validation::ValidatedTransaction;
 
 /// Open a connection to the DB and apply any pending migrations.
@@ -55,6 +60,43 @@ pub(crate) fn insert_transaction(
         .on_conflict_do_nothing()
         .execute(conn)?;
     Ok(count)
+}
+
+/// Inserts an encrypted private transaction archive record.
+///
+/// Existing records are left unchanged so repeated transaction submission stays idempotent.
+#[allow(dead_code)] // Used once validator archive integration is wired.
+#[instrument(target = COMPONENT, skip_all, fields(tx_id = %record.tx_id), err)]
+pub(crate) fn insert_private_tx_archive_record(
+    conn: &mut SqliteConnection,
+    record: &EncryptedPrivateTxRecord,
+) -> Result<usize, DatabaseError> {
+    let row = PrivateTxArchiveRecordRowInsert::new(record);
+    let count = diesel::insert_into(schema::private_tx_archive_records::table)
+        .values(row)
+        .on_conflict_do_nothing()
+        .execute(conn)?;
+    Ok(count)
+}
+
+/// Loads an encrypted private transaction archive record by transaction id.
+#[allow(dead_code)] // Used once the audit fetch path is wired.
+#[instrument(target = COMPONENT, skip(conn), fields(tx_id = %tx_id), err)]
+pub(crate) fn load_private_tx_archive_record(
+    conn: &mut SqliteConnection,
+    tx_id: TransactionId,
+) -> Result<Option<EncryptedPrivateTxRecord>, DatabaseError> {
+    let row = schema::private_tx_archive_records::table
+        .filter(schema::private_tx_archive_records::tx_id.eq(tx_id.to_bytes()))
+        .select(schema::private_tx_archive_records::record)
+        .first::<Vec<u8>>(conn)
+        .optional()?;
+
+    row.map(|bytes| {
+        EncryptedPrivateTxRecord::read_from_bytes(&bytes)
+            .map_err(|err| DatabaseError::deserialization("EncryptedPrivateTxRecord", err))
+    })
+    .transpose()
 }
 
 /// Scans the database for transaction Ids that do not exist.
@@ -159,4 +201,76 @@ pub fn count_validated_transactions(conn: &mut SqliteConnection) -> Result<i64, 
 pub fn count_signed_blocks(conn: &mut SqliteConnection) -> Result<i64, DatabaseError> {
     let count = schema::block_headers::table.select(count_star()).first::<i64>(conn)?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use diesel::Connection;
+    use miden_node_private_tx::{
+        ChainId,
+        DataKeyProtection,
+        EncryptedPrivateTxRecord,
+        PRIVATE_TX_VERSION,
+        ThresholdSchemeId,
+        ValidatorId,
+        private_tx_record_identity,
+    };
+    use miden_protocol::Word;
+    use miden_protocol::transaction::TransactionId;
+
+    use super::*;
+
+    #[test]
+    fn private_tx_archive_record_roundtrips() -> anyhow::Result<()> {
+        let (_temp_dir, mut conn) = test_connection()?;
+        let record = archive_record(1);
+
+        assert_eq!(insert_private_tx_archive_record(&mut conn, &record)?, 1);
+        assert_eq!(
+            load_private_tx_archive_record(&mut conn, record.tx_id)?,
+            Some(record.clone())
+        );
+        assert_eq!(insert_private_tx_archive_record(&mut conn, &record)?, 0);
+        assert!(load_private_tx_archive_record(&mut conn, tx_id(9))?.is_none());
+
+        Ok(())
+    }
+
+    fn test_connection() -> anyhow::Result<(tempfile::TempDir, SqliteConnection)> {
+        let temp_dir = tempfile::tempdir()?;
+        let database_filepath = temp_dir.path().join("validator.sqlite3");
+        apply_migrations(&database_filepath)?;
+        let conn = SqliteConnection::establish(database_filepath.to_str().unwrap())?;
+        Ok((temp_dir, conn))
+    }
+
+    fn archive_record(seed: u32) -> EncryptedPrivateTxRecord {
+        let chain_id = ChainId::new("miden-devnet").unwrap();
+        let tx_id = tx_id(seed);
+        let identity = private_tx_record_identity(&chain_id, tx_id);
+
+        EncryptedPrivateTxRecord {
+            version: PRIVATE_TX_VERSION,
+            chain_id,
+            tx_id,
+            viewing_group_id: word(seed + 10),
+            identity,
+            validator_id: ValidatorId::new("validator-1").unwrap(),
+            validator_encryption_key_id: word(seed + 20),
+            tee_attestation_id: word(seed + 30),
+            record_ciphertext: vec![1, 2, 3, seed as u8],
+            data_key_protection: DataKeyProtection::ThresholdWrappedKey {
+                scheme_id: ThresholdSchemeId::new(7),
+                wrapped_key: vec![4, 5, 6, seed as u8],
+            },
+        }
+    }
+
+    fn tx_id(seed: u32) -> TransactionId {
+        TransactionId::read_from_bytes(&word(seed).to_bytes()).unwrap()
+    }
+
+    fn word(seed: u32) -> Word {
+        Word::from([seed, seed + 1, seed + 2, seed + 3])
+    }
 }
