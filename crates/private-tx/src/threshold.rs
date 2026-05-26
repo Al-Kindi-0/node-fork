@@ -222,6 +222,28 @@ pub trait ThresholdShareCombiner {
     ) -> Result<RecordKeyUnlockMaterial, ThresholdError>;
 }
 
+/// Full threshold adapter surface used by private transaction archive/audit flows.
+///
+/// `ViewingGroupSetup` is included for real-backend DKG setup even when a test uses prebuilt
+/// mock group material.
+pub trait ThresholdBackend:
+    ViewingGroupSetup
+    + ThresholdRecordEncryptor
+    + ThresholdShareProducer
+    + ThresholdShareVerifier
+    + ThresholdShareCombiner
+{
+}
+
+impl<T> ThresholdBackend for T where
+    T: ViewingGroupSetup
+        + ThresholdRecordEncryptor
+        + ThresholdShareProducer
+        + ThresholdShareVerifier
+        + ThresholdShareCombiner
+{
+}
+
 pub(crate) fn validate_threshold(threshold: u16) -> Result<(), ThresholdError> {
     if threshold == 0 {
         Err(ThresholdError::InvalidThreshold)

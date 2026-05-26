@@ -35,9 +35,10 @@ pub use tee::{
 };
 pub use threshold::{
     AuditTransportPublicKey, AuditTransportSecret, DecryptionResponse, DkgDealingBytes,
-    DkgParticipant, DkgSession, RecordKeyUnlockMaterial, ThresholdError, ThresholdRecordEncryptor,
-    ThresholdShareCombiner, ThresholdShareProducer, ThresholdShareVerifier, ViewingGroupPublicKey,
-    ViewingGroupSetup, ViewingKeyShare, ViewingPartyPublicShare,
+    DkgParticipant, DkgSession, RecordKeyUnlockMaterial, ThresholdBackend, ThresholdError,
+    ThresholdRecordEncryptor, ThresholdShareCombiner, ThresholdShareProducer,
+    ThresholdShareVerifier, ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare,
+    ViewingPartyPublicShare,
 };
 pub use types::{
     ChainId, EncryptionSchemeId, PRIVATE_TX_VERSION, TeeSchemeId, ThresholdSchemeId, ValidatorId,
