@@ -18,15 +18,15 @@ use crate::db::{load, load_chain_tip, upsert_block_header};
 
 /// Test harness that wraps a [`ValidatorServer`] and tracks the chain MMR state needed to construct
 /// valid [`ProposedBlock`]s.
-struct TestValidator {
-    server: ValidatorServer,
+pub(super) struct TestValidator {
+    pub(super) server: ValidatorServer,
     chain: PartialBlockchain,
     chain_tip: BlockHeader,
 }
 
 impl TestValidator {
     /// Creates a [`ValidatorServer`] bootstrapped with a random genesis block.
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let signer = ValidatorSigner::new_local(random_secret_key());
 
         let genesis_signer = random_secret_key();
@@ -69,7 +69,7 @@ impl TestValidator {
     }
 
     /// Returns a reference to the validator's database.
-    fn db(&self) -> &miden_node_db::Db {
+    pub(super) fn db(&self) -> &miden_node_db::Db {
         &self.server.db
     }
 

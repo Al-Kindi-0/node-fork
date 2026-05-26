@@ -31,6 +31,7 @@ use crate::{COMPONENT, ValidatorSigner};
 #[cfg(test)]
 mod tests;
 
+mod get_private_tx_archive_record;
 mod sign_block;
 mod status;
 mod submit_proven_transaction;

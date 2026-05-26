@@ -18,8 +18,29 @@ service Api {
    // Submits a transaction to the validator.
    rpc SubmitProvenTransaction(transaction.ProvenTransaction) returns (google.protobuf.Empty) {}
 
+   // Fetches an encrypted private transaction archive record by transaction ID.
+   //
+   // The returned record is encrypted; access control is enforced by the threshold audit ceremony,
+   // not by this endpoint.
+   rpc GetPrivateTxArchiveRecord(PrivateTxArchiveRecordRequest) returns (PrivateTxArchiveRecord) {}
+
    // Validates a proposed block and returns the block header and body.
    rpc SignBlock(blockchain.ProposedBlock) returns (blockchain.BlockSignature) {}
+}
+
+// PRIVATE TX ARCHIVE
+// ================================================================================================
+
+// Request for a private transaction archive record.
+message PrivateTxArchiveRecordRequest {
+    // ID of the transaction whose archive record should be returned.
+    transaction.TransactionId transaction_id = 1;
+}
+
+// Encrypted private transaction archive record.
+message PrivateTxArchiveRecord {
+    // Encoded using [miden_node_private_tx::EncryptedPrivateTxRecord::to_bytes].
+    bytes record = 1;
 }
 
 // VALIDATOR STATUS
