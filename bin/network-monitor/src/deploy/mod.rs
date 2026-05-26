@@ -165,6 +165,7 @@ pub async fn deploy_counter_account(counter_account: &Account, rpc_url: &Url) ->
     let request = ProvenTransaction {
         transaction: proven_tx.to_bytes(),
         transaction_inputs: Some(transaction_inputs),
+        encrypted_private_payload: None,
     };
 
     rpc_client

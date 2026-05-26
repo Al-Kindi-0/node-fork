@@ -461,8 +461,8 @@ impl api_server::Api for RpcService {
     // -- Transaction submission --------------------------------------------------------------
 
     /// Deserializes and rebuilds the transaction with MAST decorators stripped from output note
-    /// scripts, verifies the transaction proof, optionally re-executes via the validator if
-    /// transaction inputs are provided, then forwards the transaction to the block producer.
+    /// scripts, verifies the transaction proof, re-executes via the validator, then forwards the
+    /// transaction to the block producer.
     async fn submit_proven_tx(
         &self,
         request: Request<proto::transaction::ProvenTransaction>,
@@ -476,6 +476,9 @@ impl api_server::Api for RpcService {
         };
 
         let request = request.into_inner();
+
+        reject_encrypted_private_payload(&request)?;
+        require_transaction_inputs(&request)?;
 
         let tx = ProvenTransaction::read_from_bytes(&request.transaction).map_err(|err| {
             Status::invalid_argument(err.as_report_context("invalid transaction"))
@@ -535,13 +538,7 @@ impl api_server::Api for RpcService {
             ))
         })?;
 
-        // Transaction inputs must be provided in order to allow for transaction re-execution via
-        // the Validator.
-        if request.transaction_inputs.is_some() {
-            self.validator.clone().submit_proven_transaction(request.clone()).await?;
-        } else {
-            return Err(Status::invalid_argument("Transaction inputs must be provided"));
-        }
+        self.validator.clone().submit_proven_transaction(request.clone()).await?;
 
         block_producer.clone().submit_proven_tx(request).await
     }
@@ -630,6 +627,7 @@ impl api_server::Api for RpcService {
             let request = proto::transaction::ProvenTransaction {
                 transaction: tx.to_bytes(),
                 transaction_inputs: inputs.clone().into(),
+                encrypted_private_payload: None,
             };
             self.validator.clone().submit_proven_transaction(request).await?;
         }
@@ -728,6 +726,28 @@ impl api_server::Api for RpcService {
 // HELPERS
 // ================================================================================================
 
+fn reject_encrypted_private_payload(
+    request: &proto::transaction::ProvenTransaction,
+) -> Result<(), Status> {
+    if request.encrypted_private_payload.is_some() {
+        return Err(Status::invalid_argument(
+            "Encrypted private payloads are not accepted in public validator mode",
+        ));
+    }
+
+    Ok(())
+}
+
+fn require_transaction_inputs(
+    request: &proto::transaction::ProvenTransaction,
+) -> Result<(), Status> {
+    if request.transaction_inputs.is_none() {
+        return Err(Status::invalid_argument("Transaction inputs must be provided"));
+    }
+
+    Ok(())
+}
+
 /// Strips decorators from public output notes' scripts.
 ///
 /// This removes MAST decorators from note scripts before forwarding to the block producer,
@@ -796,3 +816,70 @@ static RPC_LIMITS: LazyLock<proto::rpc::RpcLimits> = LazyLock::new(|| {
         ]),
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_mode_rejects_encrypted_private_payload() {
+        let request = request_with_encrypted_payload(Some(Vec::new()));
+
+        let err = reject_encrypted_private_payload(&request).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Encrypted private payloads"));
+
+        let encrypted_only = request_with_encrypted_payload(None);
+
+        let err = reject_encrypted_private_payload(&encrypted_only).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Encrypted private payloads"));
+    }
+
+    #[test]
+    fn public_mode_requires_cleartext_transaction_inputs() {
+        let request = proto::transaction::ProvenTransaction {
+            transaction: Vec::new(),
+            transaction_inputs: None,
+            encrypted_private_payload: None,
+        };
+
+        let err = require_transaction_inputs(&request).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Transaction inputs must be provided"));
+    }
+
+    #[tokio::test]
+    async fn public_mode_submit_proven_tx_rejects_encrypted_payload_before_transaction_decode() {
+        let service = rpc_service_with_block_producer();
+        let request = request_with_encrypted_payload(None);
+
+        let err = <RpcService as Api>::submit_proven_tx(&service, Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Encrypted private payloads"));
+    }
+
+    fn request_with_encrypted_payload(
+        transaction_inputs: Option<Vec<u8>>,
+    ) -> proto::transaction::ProvenTransaction {
+        proto::transaction::ProvenTransaction {
+            transaction: Vec::new(),
+            transaction_inputs,
+            encrypted_private_payload: Some(b"encrypted".to_vec()),
+        }
+    }
+
+    fn rpc_service_with_block_producer() -> RpcService {
+        // These endpoints are intentionally unreachable; encrypted payloads must be rejected
+        // before any network call is made.
+        RpcService::new(
+            Url::parse("http://127.0.0.1:1").expect("valid store URL"),
+            Some(Url::parse("http://127.0.0.1:2").expect("valid block-producer URL")),
+            Url::parse("http://127.0.0.1:3").expect("valid validator URL"),
+            None,
+            NonZeroUsize::new(1).expect("non-zero cache capacity"),
+        )
+    }
+}

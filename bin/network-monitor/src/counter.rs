@@ -309,6 +309,7 @@ impl IncrementService {
         let request = ProvenTransaction {
             transaction: proven_tx.to_bytes(),
             transaction_inputs: Some(tx_inputs),
+            encrypted_private_payload: None,
         };
 
         let block_height: BlockNumber = self

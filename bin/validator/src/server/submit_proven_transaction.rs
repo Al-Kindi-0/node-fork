@@ -38,9 +38,16 @@ impl grpc::server::validator_api::SubmitProvenTransaction for ValidatorServer {
     }
 
     fn decode(request: grpc::transaction::ProvenTransaction) -> tonic::Result<Self::Input> {
+        if request.encrypted_private_payload.is_some() {
+            return Err(Status::invalid_argument(
+                "Encrypted private payloads are not accepted in public validator mode",
+            ));
+        }
+
         let tx = ProvenTransaction::read_from_bytes(&request.transaction).map_err(|err| {
             Status::invalid_argument(err.as_report_context("Invalid proven transaction"))
         })?;
+
         let inputs = request
             .transaction_inputs
             .ok_or(Status::invalid_argument("Missing transaction inputs"))?;
@@ -59,4 +66,44 @@ impl grpc::server::validator_api::SubmitProvenTransaction for ValidatorServer {
 pub struct Input {
     tx: ProvenTransaction,
     inputs: TransactionInputs,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::ValidatorServer;
+    use miden_node_proto::generated as grpc;
+
+    #[test]
+    fn public_mode_rejects_encrypted_private_payload() {
+        let request = request_with_encrypted_payload(Some(Vec::new()));
+
+        let err = decode_err("encrypted payload with cleartext inputs", request);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Encrypted private payloads"));
+
+        let encrypted_only = request_with_encrypted_payload(None);
+
+        let err = decode_err("encrypted payload without cleartext inputs", encrypted_only);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Encrypted private payloads"));
+    }
+
+    fn request_with_encrypted_payload(
+        transaction_inputs: Option<Vec<u8>>,
+    ) -> grpc::transaction::ProvenTransaction {
+        grpc::transaction::ProvenTransaction {
+            transaction: Vec::new(),
+            transaction_inputs,
+            encrypted_private_payload: Some(b"encrypted".to_vec()),
+        }
+    }
+
+    fn decode_err(case: &str, request: grpc::transaction::ProvenTransaction) -> tonic::Status {
+        match <ValidatorServer as grpc::server::validator_api::SubmitProvenTransaction>::decode(
+            request,
+        ) {
+            Ok(_) => panic!("{case} should be rejected"),
+            Err(err) => err,
+        }
+    }
 }

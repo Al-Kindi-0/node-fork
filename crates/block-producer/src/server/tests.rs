@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use miden_node_proto::generated as proto;
 use miden_node_proto::generated::block_producer::api_client as block_producer_client;
 use miden_node_store::{DEFAULT_MAX_CONCURRENT_PROOFS, GenesisState, Store, StoreMode};
 use miden_node_utils::clap::{GrpcOptionsInternal, StorageOptions};
@@ -13,6 +14,8 @@ use tokio::{runtime, task};
 use tonic::transport::{Channel, Endpoint};
 use url::Url;
 
+use super::reject_encrypted_private_payload;
+use crate::errors::MempoolSubmissionError;
 use crate::{BlockProducer, DEFAULT_MAX_BATCHES_PER_BLOCK, DEFAULT_MAX_TXS_PER_BATCH};
 
 /// A wrapper around the store runtime and data directory.
@@ -32,6 +35,40 @@ impl Drop for TestStore {
             .join()
             .expect("store runtime shutdown thread should complete");
         }
+    }
+}
+
+#[test]
+fn public_mode_rejects_encrypted_private_payload() {
+    let request = proto::transaction::ProvenTransaction {
+        transaction: Vec::new(),
+        transaction_inputs: Some(Vec::new()),
+        encrypted_private_payload: Some(b"encrypted".to_vec()),
+    };
+
+    assert_encrypted_private_payload_rejected(
+        reject_encrypted_private_payload(&request).unwrap_err(),
+    );
+
+    let encrypted_only = proto::transaction::ProvenTransaction {
+        transaction: Vec::new(),
+        transaction_inputs: None,
+        encrypted_private_payload: Some(b"encrypted".to_vec()),
+    };
+
+    assert_encrypted_private_payload_rejected(
+        reject_encrypted_private_payload(&encrypted_only).unwrap_err(),
+    );
+}
+
+fn assert_encrypted_private_payload_rejected(err: MempoolSubmissionError) {
+    match err {
+        err @ MempoolSubmissionError::EncryptedPrivatePayloadUnsupported => {
+            let status: tonic::Status = err.into();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            assert!(status.message().contains("encrypted private payloads"));
+        },
+        other => panic!("unexpected error: {other:?}"),
     }
 }
 

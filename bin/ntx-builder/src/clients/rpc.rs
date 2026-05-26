@@ -118,6 +118,7 @@ impl RpcClient {
         let request = proto::transaction::ProvenTransaction {
             transaction: proven_tx.to_bytes(),
             transaction_inputs: Some(tx_inputs.to_bytes()),
+            encrypted_private_payload: None,
         };
 
         self.inner.clone().submit_proven_tx(request).await?;

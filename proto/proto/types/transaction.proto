@@ -17,6 +17,9 @@ import "types/primitives.proto";
 //
 // This means the transaction is _not_ private wrt the network operator (but it is still
 // private onchain). This requirement will be lifted as Miden matures.
+//
+// The encrypted_private_payload field is reserved for private validator mode. Public mode
+// currently rejects it.
 message ProvenTransaction {
   // The transaction proof.
   //
@@ -26,8 +29,12 @@ message ProvenTransaction {
   //
   // Encoded using [miden_protocol::transaction::TransactionInputs::to_bytes].
   //
-  // Transactions missing this field will be rejected as per the message description.
+  // Public mode requires this field so the validator can re-execute the transaction.
   optional bytes transaction_inputs = 2;
+  // Opaque encrypted private inputs for private validator mode.
+  //
+  // While only public validator mode is supported, this field must be absent.
+  optional bytes encrypted_private_payload = 3;
 }
 
 // A proven batch of transactions.

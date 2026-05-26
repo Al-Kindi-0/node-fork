@@ -308,6 +308,8 @@ impl BlockProducerRpcServer {
     ) -> Result<proto::blockchain::BlockNumber, MempoolSubmissionError> {
         debug!(target: COMPONENT, ?request);
 
+        reject_encrypted_private_payload(&request)?;
+
         let tx = ProvenTransaction::read_from_bytes(&request.transaction)
             .map_err(MempoolSubmissionError::DeserializationFailed)?;
 
@@ -392,6 +394,16 @@ impl BlockProducerRpcServer {
             .map(Into::into);
         result
     }
+}
+
+fn reject_encrypted_private_payload(
+    request: &proto::transaction::ProvenTransaction,
+) -> Result<(), MempoolSubmissionError> {
+    if request.encrypted_private_payload.is_some() {
+        return Err(MempoolSubmissionError::EncryptedPrivatePayloadUnsupported);
+    }
+
+    Ok(())
 }
 
 #[tonic::async_trait]

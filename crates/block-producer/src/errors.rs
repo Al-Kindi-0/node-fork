@@ -74,6 +74,9 @@ pub enum MempoolSubmissionError {
     #[error("the mempool is at capacity")]
     CapacityExceeded,
 
+    #[error("encrypted private payloads are not accepted in public validator mode")]
+    EncryptedPrivatePayloadUnsupported,
+
     #[error("mempool lock is poisoned")]
     #[grpc(internal)]
     MempoolPoisoned(#[source] MempoolPoisonError),
