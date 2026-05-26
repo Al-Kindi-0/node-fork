@@ -6,17 +6,17 @@
 use std::time::Instant;
 
 use miden_node_private_tx::{
-    ArchiveAssociatedData, ArchiveRecordAssociatedData, ArchiveRecordKey, ChainId,
-    EncryptedPrivateTxPayload, EncryptedPrivateTxRecord, PRIVATE_TX_VERSION, PrivateTxRecord,
-    PrivateTxRecordMetadata, SubmissionEncryptionAssociatedData, SubmissionPayloadAssociatedData,
-    ThresholdRecordEncryptor, ThresholdShareCombiner, ThresholdShareProducer,
-    ThresholdShareVerifier, ValidatorId, ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare,
-    ViewingPartyId, ViewingPartyPublicShare, ViewingPolicy, archive_associated_data,
-    archive_associated_data_for_record, decrypt_submission_payload, encrypt_submission_payload,
-    open_private_tx_record, private_tx_record_identity, seal_private_tx_record,
+    ArchiveAssociatedData, ArchiveRecordKey, ChainId, EncryptedPrivateTxPayload,
+    EncryptedPrivateTxRecord, PRIVATE_TX_VERSION, PrivateTxRecord, PrivateTxRecordMetadata,
+    SubmissionEncryptionAssociatedData, SubmissionPayloadAssociatedData, ThresholdRecordEncryptor,
+    ValidatorId, ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare, ViewingPartyId,
+    ViewingPartyPublicShare, ViewingPolicy, archive_associated_data, decrypt_submission_payload,
+    encrypt_submission_payload, private_tx_record_identity, seal_private_tx_record,
     submission_associated_data_for_encryption, submission_associated_data_for_payload,
 };
-use miden_node_private_tx_golden::{GOLDEN_THRESHOLD_SCHEME_ID, GoldenThresholdAdapter};
+use miden_node_private_tx_golden::{
+    GOLDEN_THRESHOLD_SCHEME_ID, GoldenThresholdAdapter, decrypt_private_tx_archive_record,
+};
 use miden_protocol::crypto::dsa::eddsa_25519_sha512::SecretKey;
 use miden_protocol::crypto::ies::{SealingKey, UnsealingKey};
 use miden_protocol::transaction::TransactionId;
@@ -51,7 +51,12 @@ fn main() -> DemoResult<()> {
     let validator_duration = validator_started.elapsed();
 
     let audit_started = Instant::now();
-    let audit = auditor_decrypts_archive(&adapter, &viewing_group, &archive)?;
+    let audit = decrypt_private_tx_archive_record(
+        &archive.record,
+        viewing_group.threshold,
+        &viewing_group.key_shares,
+        &viewing_group.public_shares,
+    )?;
     let audit_duration = audit_started.elapsed();
 
     let expected = expected_private_tx_record(&fixture, PRIVATE_PAYLOAD.to_vec());
@@ -200,12 +205,6 @@ struct ArchiveOutput {
     wrapped_key_bytes: usize,
 }
 
-struct AuditOutput {
-    record: PrivateTxRecord,
-    response_count: usize,
-    response_bytes_total: usize,
-}
-
 fn client_encrypts_private_payload(fixture: &Fixture) -> DemoResult<Vec<u8>> {
     let submission_ad =
         submission_associated_data_for_encryption(SubmissionEncryptionAssociatedData {
@@ -271,59 +270,6 @@ fn validator_decrypts_and_archives(
             data_key_protection,
         },
         wrapped_key_bytes,
-    })
-}
-
-fn auditor_decrypts_archive(
-    adapter: &GoldenThresholdAdapter,
-    viewing_group: &ViewingGroup,
-    archive: &ArchiveOutput,
-) -> DemoResult<AuditOutput> {
-    let record = EncryptedPrivateTxRecord::read_from_bytes(&archive.record.to_bytes())?;
-    let archive_ad =
-        archive_associated_data_for_record(ArchiveRecordAssociatedData { record: &record });
-    let (transport_public_key, transport_secret) =
-        GoldenThresholdAdapter::audit_transport_keypair();
-    let responses = viewing_group
-        .key_shares
-        .iter()
-        .take(usize::from(viewing_group.threshold))
-        .map(|share| {
-            adapter.produce_decryption_response(
-                share,
-                &record.identity,
-                &archive_ad,
-                &transport_public_key,
-                &record.data_key_protection,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let response_bytes_total = responses.iter().map(|response| response.bytes.len()).sum();
-
-    for (response, public_share) in responses.iter().zip(viewing_group.public_shares.iter()) {
-        adapter.verify_decryption_response(
-            response,
-            &record.identity,
-            &archive_ad,
-            &transport_public_key,
-            public_share,
-        )?;
-    }
-
-    let unlock = adapter.combine_responses(
-        &record.data_key_protection,
-        &responses,
-        viewing_group.threshold,
-        &record.identity,
-        &archive_ad,
-        &transport_secret,
-    )?;
-    let record_key = ArchiveRecordKey::from_bytes(&unlock.record_key)?;
-    let plaintext = open_private_tx_record(&record_key, &record.record_ciphertext, &archive_ad)?;
-    Ok(AuditOutput {
-        record: PrivateTxRecord::read_from_bytes(&plaintext)?,
-        response_count: responses.len(),
-        response_bytes_total,
     })
 }
 

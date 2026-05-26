@@ -4,10 +4,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+mod audit;
 mod compat;
 mod wire;
 #[cfg(test)]
 mod wire_tests;
+
+pub use audit::{AuditDecryption, AuditOrchestratorError, decrypt_private_tx_archive_record};
 
 use ark_bls12_381::G1Affine;
 use ark_ec::{AffineRepr, CurveGroup};

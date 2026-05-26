@@ -26,3 +26,4 @@ golden-dkg           = { workspace = true }
 miden-node-private-tx = { workspace = true }
 miden-protocol       = { workspace = true }
 rand08               = { workspace = true }
+thiserror            = { workspace = true }
