@@ -1,3 +1,4 @@
+use std::fmt::{self, Formatter};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -6,11 +7,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use anyhow::Context;
 use miden_node_db::Db;
+use miden_node_private_tx::{ChainId, ValidatorId};
 use miden_node_proto::generated::validator::api_server;
 use miden_node_proto_build::validator_api_descriptor;
 use miden_node_utils::clap::GrpcOptionsInternal;
 use miden_node_utils::panic::catch_panic_layer_fn;
 use miden_node_utils::tracing::grpc::grpc_trace_fn;
+use miden_protocol::crypto::ies::UnsealingKey;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -111,6 +114,49 @@ impl Validator {
     }
 }
 
+pub(crate) struct PrivateTxPayloadDecryptor {
+    chain_id: ChainId,
+    validator_id: ValidatorId,
+    unsealing_key: UnsealingKey,
+}
+
+impl PrivateTxPayloadDecryptor {
+    #[cfg(test)]
+    pub(crate) fn new(
+        chain_id: ChainId,
+        validator_id: ValidatorId,
+        unsealing_key: UnsealingKey,
+    ) -> Self {
+        Self { chain_id, validator_id, unsealing_key }
+    }
+}
+
+impl fmt::Debug for PrivateTxPayloadDecryptor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateTxPayloadDecryptor")
+            .field("chain_id", &self.chain_id)
+            .field("validator_id", &self.validator_id)
+            .field("unsealing_key", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) enum PrivateTxSubmissionMode {
+    Public,
+    // Constructed once validator private-mode config is wired.
+    #[allow(dead_code)]
+    Private(PrivateTxPayloadDecryptor),
+}
+
+impl fmt::Debug for PrivateTxSubmissionMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Public => f.write_str("Public"),
+            Self::Private(decryptor) => f.debug_tuple("Private").field(decryptor).finish(),
+        }
+    }
+}
+
 // VALIDATOR SERVER
 // ================================================================================
 
@@ -129,6 +175,8 @@ struct ValidatorServer {
     validated_transactions_count: AtomicU64,
     /// In-memory count of signed blocks, incremented after each signed block.
     signed_blocks_count: AtomicU64,
+    /// Controls whether transaction inputs are accepted in clear or encrypted form.
+    private_tx_submission: PrivateTxSubmissionMode,
 }
 
 impl ValidatorServer {
@@ -146,6 +194,7 @@ impl ValidatorServer {
             chain_tip: AtomicU32::new(initial_chain_tip),
             validated_transactions_count: AtomicU64::new(initial_tx_count),
             signed_blocks_count: AtomicU64::new(initial_block_count),
+            private_tx_submission: PrivateTxSubmissionMode::Public,
         }
     }
 }

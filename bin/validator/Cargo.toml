@@ -26,6 +26,7 @@ diesel                 = { workspace = true }
 fs-err                 = { workspace = true }
 hex                    = { workspace = true }
 miden-node-db          = { workspace = true }
+miden-node-private-tx  = { workspace = true }
 miden-node-proto       = { workspace = true }
 miden-node-proto-build = { features = ["internal"], workspace = true }
 miden-node-store       = { workspace = true }

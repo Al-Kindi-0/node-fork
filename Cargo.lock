@@ -4220,6 +4220,7 @@ dependencies = [
  "fs-err",
  "hex",
  "miden-node-db",
+ "miden-node-private-tx",
  "miden-node-proto",
  "miden-node-proto-build",
  "miden-node-store",
