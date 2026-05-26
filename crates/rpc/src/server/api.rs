@@ -56,6 +56,7 @@ pub struct RpcService {
     ntx_builder: Option<NtxBuilderClient>,
     genesis_commitment: Option<Word>,
     block_commitment_cache: LruCache<BlockNumber, Word>,
+    private_tx_submission: PrivateTxSubmissionMode,
 }
 
 impl RpcService {
@@ -129,6 +130,7 @@ impl RpcService {
             ntx_builder,
             genesis_commitment: None,
             block_commitment_cache: LruCache::new(commitment_cache_capacity),
+            private_tx_submission: PrivateTxSubmissionMode::Public,
         }
     }
 
@@ -477,8 +479,9 @@ impl api_server::Api for RpcService {
 
         let request = request.into_inner();
 
-        reject_encrypted_private_payload(&request)?;
-        require_transaction_inputs(&request)?;
+        let private_inputs = PrivateInputCarrier::from_request(&request)?;
+        // Decode is config-free; public-mode policy is enforced here before transaction parsing.
+        private_inputs.reject_if_private_mode_disabled(&self.private_tx_submission)?;
 
         let tx = ProvenTransaction::read_from_bytes(&request.transaction).map_err(|err| {
             Status::invalid_argument(err.as_report_context("invalid transaction"))
@@ -540,6 +543,7 @@ impl api_server::Api for RpcService {
 
         self.validator.clone().submit_proven_transaction(request.clone()).await?;
 
+        private_inputs.strip_from_block_producer_request(&mut request);
         block_producer.clone().submit_proven_tx(request).await
     }
 
@@ -726,26 +730,55 @@ impl api_server::Api for RpcService {
 // HELPERS
 // ================================================================================================
 
-fn reject_encrypted_private_payload(
-    request: &proto::transaction::ProvenTransaction,
-) -> Result<(), Status> {
-    if request.encrypted_private_payload.is_some() {
-        return Err(Status::invalid_argument(
-            "Encrypted private payloads are not accepted in public validator mode",
-        ));
-    }
-
-    Ok(())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateTxSubmissionMode {
+    Public,
+    // Constructed once RPC private-mode config is wired.
+    #[allow(dead_code)]
+    Private,
 }
 
-fn require_transaction_inputs(
-    request: &proto::transaction::ProvenTransaction,
-) -> Result<(), Status> {
-    if request.transaction_inputs.is_none() {
-        return Err(Status::invalid_argument("Transaction inputs must be provided"));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateInputCarrier {
+    Cleartext,
+    Encrypted,
+}
+
+impl PrivateInputCarrier {
+    fn from_request(request: &proto::transaction::ProvenTransaction) -> Result<Self, Status> {
+        match (
+            request.transaction_inputs.is_some(),
+            request.encrypted_private_payload.is_some(),
+        ) {
+            (true, false) => Ok(Self::Cleartext),
+            (false, true) => Ok(Self::Encrypted),
+            (true, true) => Err(Status::invalid_argument(
+                "Provide either transaction inputs or encrypted private payload, not both",
+            )),
+            (false, false) => Err(Status::invalid_argument("Transaction inputs must be provided")),
+        }
     }
 
-    Ok(())
+    fn reject_if_private_mode_disabled(&self, mode: &PrivateTxSubmissionMode) -> Result<(), Status> {
+        if matches!(self, Self::Encrypted) && matches!(mode, PrivateTxSubmissionMode::Public) {
+            return Err(encrypted_private_payload_unsupported());
+        }
+
+        Ok(())
+    }
+
+    fn strip_from_block_producer_request(
+        &self,
+        request: &mut proto::transaction::ProvenTransaction,
+    ) {
+        if matches!(self, Self::Encrypted) {
+            request.encrypted_private_payload = None;
+        }
+    }
+}
+
+fn encrypted_private_payload_unsupported() -> Status {
+    Status::invalid_argument("Encrypted private payloads are not accepted in public validator mode")
 }
 
 /// Strips decorators from public output notes' scripts.
@@ -822,31 +855,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_mode_rejects_encrypted_private_payload() {
+    fn input_carrier_requires_exactly_one_payload() {
+        let cleartext = proto::transaction::ProvenTransaction {
+            transaction: Vec::new(),
+            transaction_inputs: Some(Vec::new()),
+            encrypted_private_payload: None,
+        };
+        assert_eq!(
+            PrivateInputCarrier::from_request(&cleartext).unwrap(),
+            PrivateInputCarrier::Cleartext,
+        );
+
+        let encrypted = request_with_encrypted_payload(None);
+        assert_eq!(
+            PrivateInputCarrier::from_request(&encrypted).unwrap(),
+            PrivateInputCarrier::Encrypted,
+        );
+
         let request = request_with_encrypted_payload(Some(Vec::new()));
-
-        let err = reject_encrypted_private_payload(&request).unwrap_err();
+        let err = PrivateInputCarrier::from_request(&request).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("Encrypted private payloads"));
+        assert!(err.message().contains("either transaction inputs or encrypted private payload"));
 
-        let encrypted_only = request_with_encrypted_payload(None);
+        let missing = proto::transaction::ProvenTransaction {
+            transaction: Vec::new(),
+            transaction_inputs: None,
+            encrypted_private_payload: None,
+        };
+        let err = PrivateInputCarrier::from_request(&missing).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Transaction inputs must be provided"));
+    }
 
-        let err = reject_encrypted_private_payload(&encrypted_only).unwrap_err();
+    #[test]
+    fn public_mode_rejects_encrypted_private_payload() {
+        let request = request_with_encrypted_payload(None);
+        let carrier = PrivateInputCarrier::from_request(&request).unwrap();
+
+        let err = carrier
+            .reject_if_private_mode_disabled(&PrivateTxSubmissionMode::Public)
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("Encrypted private payloads"));
     }
 
     #[test]
-    fn public_mode_requires_cleartext_transaction_inputs() {
-        let request = proto::transaction::ProvenTransaction {
+    fn private_mode_accepts_encrypted_private_payload() {
+        let request = request_with_encrypted_payload(None);
+        let carrier = PrivateInputCarrier::from_request(&request).unwrap();
+
+        carrier
+            .reject_if_private_mode_disabled(&PrivateTxSubmissionMode::Private)
+            .unwrap();
+    }
+
+    #[test]
+    fn encrypted_payload_is_stripped_before_block_producer_submission() {
+        let carrier = PrivateInputCarrier::Encrypted;
+        let mut request = proto::transaction::ProvenTransaction {
             transaction: Vec::new(),
             transaction_inputs: None,
-            encrypted_private_payload: None,
+            encrypted_private_payload: Some(b"encrypted".to_vec()),
         };
 
-        let err = require_transaction_inputs(&request).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("Transaction inputs must be provided"));
+        carrier.strip_from_block_producer_request(&mut request);
+
+        assert!(request.encrypted_private_payload.is_none());
     }
 
     #[tokio::test]

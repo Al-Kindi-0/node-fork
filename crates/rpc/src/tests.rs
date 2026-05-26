@@ -430,7 +430,7 @@ async fn rpc_server_rejects_proven_transactions_with_invalid_commitment() {
 
     let request = proto::transaction::ProvenTransaction {
         transaction: tx_bytes,
-        transaction_inputs: None,
+        transaction_inputs: Some(Vec::new()),
         encrypted_private_payload: None,
     };
 
@@ -474,7 +474,7 @@ async fn rpc_server_rejects_proven_transactions_with_invalid_reference_block() {
 
     let request = proto::transaction::ProvenTransaction {
         transaction: tx.to_bytes(),
-        transaction_inputs: None,
+        transaction_inputs: Some(Vec::new()),
         encrypted_private_payload: None,
     };
 
@@ -513,7 +513,7 @@ async fn rpc_server_rejects_tx_submissions_without_genesis() {
 
     let request = proto::transaction::ProvenTransaction {
         transaction: tx.to_bytes(),
-        transaction_inputs: None,
+        transaction_inputs: Some(Vec::new()),
         encrypted_private_payload: None,
     };
 
