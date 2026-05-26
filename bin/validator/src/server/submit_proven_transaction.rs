@@ -171,7 +171,12 @@ mod tests {
     use miden_protocol::utils::serde::{Deserializable, Serializable};
     use miden_protocol::{ONE, Word};
 
-    use crate::server::{PrivateTxPayloadDecryptor, PrivateTxSubmissionMode, ValidatorServer};
+    use crate::server::{
+        PrivateTxPayloadDecryptor,
+        PrivateTxSubmissionConfig,
+        PrivateTxSubmissionMode,
+        ValidatorServer,
+    };
     use miden_node_proto::generated as grpc;
 
     #[test]
@@ -269,11 +274,13 @@ mod tests {
         )
         .unwrap();
         let input = super::SubmittedTransactionInputs::Encrypted(payload.to_bytes());
-        let decryptor = PrivateTxPayloadDecryptor::new(chain_id, validator_id, unsealing_key);
+        let mode = PrivateTxSubmissionMode::from(PrivateTxSubmissionConfig::Private {
+            chain_id,
+            validator_id,
+            unsealing_key,
+        });
 
-        let actual = input
-            .into_transaction_inputs(&PrivateTxSubmissionMode::Private(decryptor), tx_id)
-            .unwrap();
+        let actual = input.into_transaction_inputs(&mode, tx_id).unwrap();
 
         assert_eq!(actual, expected);
     }

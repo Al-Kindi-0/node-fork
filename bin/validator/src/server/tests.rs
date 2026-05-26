@@ -9,7 +9,7 @@ use miden_protocol::testing::random_secret_key::random_secret_key;
 use miden_protocol::transaction::PartialBlockchain;
 use miden_tx::utils::serde::Serializable;
 
-use super::ValidatorServer;
+use super::{PrivateTxSubmissionConfig, ValidatorServer};
 use crate::ValidatorSigner;
 use crate::db::{load, load_chain_tip, upsert_block_header};
 
@@ -46,7 +46,7 @@ impl TestValidator {
         .unwrap();
 
         Self {
-            server: ValidatorServer::new(signer, db, 0, 0, 0),
+            server: ValidatorServer::new(signer, db, 0, 0, 0, PrivateTxSubmissionConfig::Public),
             chain: PartialBlockchain::default(),
             chain_tip: genesis_header,
         }

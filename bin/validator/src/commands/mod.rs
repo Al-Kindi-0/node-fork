@@ -4,11 +4,14 @@ mod start;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use anyhow::{Context, bail};
 use clap::Parser;
+use miden_node_private_tx::{ChainId, ValidatorId};
 use miden_node_utils::clap::GrpcOptionsInternal;
 use miden_protocol::crypto::dsa::ecdsa_k256_keccak::SecretKey;
+use miden_protocol::crypto::ies::{IesScheme, UnsealingKey};
 use miden_protocol::utils::serde::Deserializable;
-use miden_validator::ValidatorSigner;
+use miden_validator::{PrivateTxSubmissionConfig, ValidatorSigner};
 
 const ENV_DATA_DIRECTORY: &str = "MIDEN_NODE_DATA_DIRECTORY";
 const ENV_LISTEN: &str = "MIDEN_NODE_VALIDATOR_LISTEN";
@@ -17,6 +20,10 @@ const ENV_KMS_KEY_ID: &str = "MIDEN_NODE_VALIDATOR_KMS_KEY_ID";
 const ENV_ENABLE_OTEL: &str = "MIDEN_NODE_ENABLE_OTEL";
 const ENV_GENESIS_CONFIG_FILE: &str = "MIDEN_NODE_VALIDATOR_GENESIS_CONFIG_FILE";
 const ENV_SQLITE_CONNECTION_POOL_SIZE: &str = "MIDEN_NODE_VALIDATOR_SQLITE_CONNECTION_POOL_SIZE";
+const ENV_PRIVATE_TX_CHAIN_ID: &str = "MIDEN_NODE_VALIDATOR_PRIVATE_TX_CHAIN_ID";
+const ENV_PRIVATE_TX_VALIDATOR_ID: &str = "MIDEN_NODE_VALIDATOR_PRIVATE_TX_VALIDATOR_ID";
+const ENV_PRIVATE_TX_UNSEALING_KEY_FILE: &str =
+    "MIDEN_NODE_VALIDATOR_PRIVATE_TX_UNSEALING_KEY_FILE";
 
 /// A predefined, insecure validator key for development purposes.
 pub(crate) const INSECURE_KEY_HEX: &str =
@@ -88,6 +95,9 @@ pub enum ValidatorCommand {
         #[arg(long, env = ENV_DATA_DIRECTORY, value_name = "DIR")]
         data_directory: PathBuf,
 
+        #[command(flatten)]
+        private_tx: PrivateTxConfig,
+
         /// Insecure, hex-encoded validator secret key for development and testing purposes.
         ///
         /// If not provided, a predefined key is used.
@@ -143,9 +153,11 @@ impl ValidatorCommand {
                 data_directory,
                 kms_key_id,
                 sqlite_connection_pool_size,
+                private_tx,
                 ..
             } => {
                 let address = listen;
+                let private_tx_submission = private_tx.into_submission_config()?;
 
                 if let Some(kms_key_id) = kms_key_id {
                     let signer = ValidatorSigner::new_kms(kms_key_id).await?;
@@ -155,6 +167,7 @@ impl ValidatorCommand {
                         signer,
                         data_directory,
                         sqlite_connection_pool_size,
+                        private_tx_submission,
                     )
                     .await
                 } else {
@@ -166,6 +179,7 @@ impl ValidatorCommand {
                         signer,
                         data_directory,
                         sqlite_connection_pool_size,
+                        private_tx_submission,
                     )
                     .await
                 }
@@ -177,6 +191,73 @@ impl ValidatorCommand {
         match self {
             Self::Start { enable_otel, .. } => *enable_otel,
             Self::Bootstrap { .. } => false,
+        }
+    }
+}
+
+// PRIVATE TX CONFIG
+// ================================================================================================
+
+#[derive(clap::Args, Debug, Default)]
+pub struct PrivateTxConfig {
+    /// Chain ID to bind encrypted private transaction payloads to.
+    #[arg(long = "private-tx.chain-id", env = ENV_PRIVATE_TX_CHAIN_ID, value_name = "CHAIN_ID")]
+    chain_id: Option<String>,
+
+    /// Validator ID to bind encrypted private transaction payloads to.
+    #[arg(
+        long = "private-tx.validator-id",
+        env = ENV_PRIVATE_TX_VALIDATOR_ID,
+        value_name = "VALIDATOR_ID"
+    )]
+    validator_id: Option<String>,
+
+    /// File containing a Miden-serialized private transaction unsealing key.
+    #[arg(
+        long = "private-tx.unsealing-key-file",
+        env = ENV_PRIVATE_TX_UNSEALING_KEY_FILE,
+        value_name = "FILE"
+    )]
+    unsealing_key_file: Option<PathBuf>,
+}
+
+impl PrivateTxConfig {
+    fn into_submission_config(self) -> anyhow::Result<PrivateTxSubmissionConfig> {
+        match (self.chain_id, self.validator_id, self.unsealing_key_file) {
+            (None, None, None) => Ok(PrivateTxSubmissionConfig::Public),
+            (Some(chain_id), Some(validator_id), Some(unsealing_key_file)) => {
+                let chain_id = ChainId::new(chain_id)?;
+                let validator_id = ValidatorId::new(validator_id)?;
+                let bytes = fs_err::read(&unsealing_key_file).with_context(|| {
+                    format!(
+                        "failed to read private tx unsealing key file {}",
+                        unsealing_key_file.display()
+                    )
+                })?;
+                let unsealing_key = UnsealingKey::read_from_bytes(&bytes).with_context(|| {
+                    format!(
+                        "failed to parse private tx unsealing key from {}",
+                        unsealing_key_file.display()
+                    )
+                })?;
+                if unsealing_key.scheme() != IesScheme::X25519XChaCha20Poly1305 {
+                    bail!(
+                        "private tx unsealing key must use {}, got {}",
+                        IesScheme::X25519XChaCha20Poly1305,
+                        unsealing_key.scheme()
+                    );
+                }
+
+                Ok(PrivateTxSubmissionConfig::Private {
+                    chain_id,
+                    validator_id,
+                    unsealing_key,
+                })
+            },
+            _ => bail!(
+                "private tx mode requires --private-tx.chain-id, \
+                 --private-tx.validator-id, and --private-tx.unsealing-key-file"
+            ),
         }
     }
 }
@@ -218,6 +299,113 @@ impl ValidatorKey {
         } else {
             let signer = SecretKey::read_from_bytes(hex::decode(self.validator_key)?.as_ref())?;
             Ok(ValidatorSigner::new_local(signer))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use miden_protocol::crypto::dsa::{
+        ecdsa_k256_keccak::SecretKey as K256SecretKey,
+        eddsa_25519_sha512::SecretKey as X25519SecretKey,
+    };
+    use miden_protocol::utils::serde::Serializable;
+
+    use super::*;
+
+    #[test]
+    fn private_tx_config_defaults_to_public_mode() {
+        let config = PrivateTxConfig::default().into_submission_config().unwrap();
+
+        assert!(matches!(config, PrivateTxSubmissionConfig::Public));
+    }
+
+    #[test]
+    fn private_tx_config_requires_all_private_fields() {
+        let config = PrivateTxConfig {
+            chain_id: Some("miden-devnet".to_string()),
+            validator_id: None,
+            unsealing_key_file: None,
+        };
+
+        let err = config.into_submission_config().unwrap_err();
+
+        assert!(err.to_string().contains("--private-tx.chain-id"));
+        assert!(err.to_string().contains("--private-tx.validator-id"));
+        assert!(err.to_string().contains("--private-tx.unsealing-key-file"));
+    }
+
+    #[test]
+    fn private_tx_config_loads_unsealing_key_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("unsealing.key");
+        let key = UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new());
+        fs_err::write(&key_path, key.to_bytes()).unwrap();
+        let config = private_tx_config_with_key_path(key_path);
+
+        let config = config.into_submission_config().unwrap();
+
+        let PrivateTxSubmissionConfig::Private {
+            chain_id,
+            validator_id,
+            unsealing_key,
+        } = config
+        else {
+            panic!("expected private mode config");
+        };
+        assert_eq!(chain_id.as_str(), "miden-devnet");
+        assert_eq!(validator_id.as_str(), "validator-1");
+        assert_eq!(unsealing_key.scheme(), IesScheme::X25519XChaCha20Poly1305);
+    }
+
+    #[test]
+    fn private_tx_config_rejects_missing_unsealing_key_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("missing.key");
+        let config = private_tx_config_with_key_path(key_path.clone());
+
+        let err = config.into_submission_config().unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("failed to read private tx unsealing key file"));
+        assert!(message.contains(&key_path.display().to_string()));
+    }
+
+    #[test]
+    fn private_tx_config_rejects_malformed_unsealing_key_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("malformed.key");
+        fs_err::write(&key_path, b"not-a-key").unwrap();
+        let config = private_tx_config_with_key_path(key_path.clone());
+
+        let err = config.into_submission_config().unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("failed to parse private tx unsealing key"));
+        assert!(message.contains(&key_path.display().to_string()));
+    }
+
+    #[test]
+    fn private_tx_config_rejects_unsupported_unsealing_key_scheme() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("k256.key");
+        let key = UnsealingKey::K256XChaCha20Poly1305(K256SecretKey::new());
+        fs_err::write(&key_path, key.to_bytes()).unwrap();
+        let config = private_tx_config_with_key_path(key_path);
+
+        let err = config.into_submission_config().unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("private tx unsealing key must use"));
+        assert!(message.contains("X25519+XChaCha20-Poly1305"));
+        assert!(message.contains("K256+XChaCha20-Poly1305"));
+    }
+
+    fn private_tx_config_with_key_path(key_path: PathBuf) -> PrivateTxConfig {
+        PrivateTxConfig {
+            chain_id: Some("miden-devnet".to_string()),
+            validator_id: Some("validator-1".to_string()),
+            unsealing_key_file: Some(key_path),
         }
     }
 }

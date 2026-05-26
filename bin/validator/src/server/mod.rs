@@ -57,6 +57,9 @@ pub struct Validator {
 
     /// Maximum number of SQLite connections in the validator database connection pool.
     pub sqlite_connection_pool_size: NonZeroUsize,
+
+    /// Private transaction submission mode.
+    pub private_tx_submission: PrivateTxSubmissionConfig,
 }
 
 impl Validator {
@@ -106,11 +109,47 @@ impl Validator {
                 initial_chain_tip,
                 initial_tx_count,
                 initial_block_count,
+                self.private_tx_submission,
             )))
             .add_service(reflection_service)
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .context("failed to serve validator API")
+    }
+}
+
+/// Runtime mode for validator private transaction submissions.
+pub enum PrivateTxSubmissionConfig {
+    /// Require clear transaction inputs and reject encrypted private payloads.
+    Public,
+    /// Accept encrypted private payloads and decrypt them with this validator key.
+    Private {
+        /// Chain ID bound into the encrypted submission associated data.
+        chain_id: ChainId,
+        /// Validator ID bound into the encrypted submission associated data.
+        validator_id: ValidatorId,
+        /// Validator private key used to decrypt submitted private payloads.
+        unsealing_key: UnsealingKey,
+    },
+}
+
+impl fmt::Debug for PrivateTxSubmissionConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Public => f.write_str("Public"),
+            Self::Private { chain_id, validator_id, .. } => f
+                .debug_struct("Private")
+                .field("chain_id", chain_id)
+                .field("validator_id", validator_id)
+                .field("unsealing_key", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl Default for PrivateTxSubmissionConfig {
+    fn default() -> Self {
+        Self::Public
     }
 }
 
@@ -121,12 +160,7 @@ pub(crate) struct PrivateTxPayloadDecryptor {
 }
 
 impl PrivateTxPayloadDecryptor {
-    #[cfg(test)]
-    pub(crate) fn new(
-        chain_id: ChainId,
-        validator_id: ValidatorId,
-        unsealing_key: UnsealingKey,
-    ) -> Self {
+    fn new(chain_id: ChainId, validator_id: ValidatorId, unsealing_key: UnsealingKey) -> Self {
         Self { chain_id, validator_id, unsealing_key }
     }
 }
@@ -143,8 +177,6 @@ impl fmt::Debug for PrivateTxPayloadDecryptor {
 
 pub(crate) enum PrivateTxSubmissionMode {
     Public,
-    // Constructed once validator private-mode config is wired.
-    #[allow(dead_code)]
     Private(PrivateTxPayloadDecryptor),
 }
 
@@ -153,6 +185,23 @@ impl fmt::Debug for PrivateTxSubmissionMode {
         match self {
             Self::Public => f.write_str("Public"),
             Self::Private(decryptor) => f.debug_tuple("Private").field(decryptor).finish(),
+        }
+    }
+}
+
+impl From<PrivateTxSubmissionConfig> for PrivateTxSubmissionMode {
+    fn from(config: PrivateTxSubmissionConfig) -> Self {
+        match config {
+            PrivateTxSubmissionConfig::Public => Self::Public,
+            PrivateTxSubmissionConfig::Private {
+                chain_id,
+                validator_id,
+                unsealing_key,
+            } => Self::Private(PrivateTxPayloadDecryptor::new(
+                chain_id,
+                validator_id,
+                unsealing_key,
+            )),
         }
     }
 }
@@ -186,6 +235,7 @@ impl ValidatorServer {
         initial_chain_tip: u32,
         initial_tx_count: u64,
         initial_block_count: u64,
+        private_tx_submission: PrivateTxSubmissionConfig,
     ) -> Self {
         Self {
             signer,
@@ -194,7 +244,7 @@ impl ValidatorServer {
             chain_tip: AtomicU32::new(initial_chain_tip),
             validated_transactions_count: AtomicU64::new(initial_tx_count),
             signed_blocks_count: AtomicU64::new(initial_block_count),
-            private_tx_submission: PrivateTxSubmissionMode::Public,
+            private_tx_submission: private_tx_submission.into(),
         }
     }
 }

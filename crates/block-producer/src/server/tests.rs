@@ -7,7 +7,7 @@ use miden_node_store::{DEFAULT_MAX_CONCURRENT_PROOFS, GenesisState, Store, Store
 use miden_node_utils::clap::{GrpcOptionsInternal, StorageOptions};
 use miden_node_utils::fee::test_fee_params;
 use miden_protocol::testing::random_secret_key::random_secret_key;
-use miden_validator::{Validator, ValidatorSigner};
+use miden_validator::{PrivateTxSubmissionConfig, Validator, ValidatorSigner};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio::{runtime, task};
@@ -109,6 +109,7 @@ async fn block_producer_startup_is_robust_to_network_failures() {
             signer: ValidatorSigner::new_local(random_secret_key()),
             data_directory,
             sqlite_connection_pool_size: NonZeroUsize::new(2).unwrap(),
+            private_tx_submission: PrivateTxSubmissionConfig::Public,
         }
         .serve()
         .await
