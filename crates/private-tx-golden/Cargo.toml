@@ -1,0 +1,28 @@
+[package]
+authors.workspace      = true
+description            = "golden-rs threshold adapter for Miden private validator transactions"
+edition.workspace      = true
+homepage.workspace     = true
+keywords               = ["miden", "node", "private-validator", "threshold"]
+license.workspace      = true
+name                   = "miden-node-private-tx-golden"
+readme                 = "README.md"
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+ark-bls12-381        = { workspace = true }
+ark-ec               = { workspace = true }
+ark-ff               = { workspace = true }
+ark-serialize        = { workspace = true }
+golden-dkg           = { workspace = true }
+miden-node-private-tx = { workspace = true }
+miden-protocol       = { workspace = true }
+rand08               = { workspace = true }

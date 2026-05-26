@@ -18,6 +18,8 @@ pub enum ThresholdError {
     ThresholdExceedsParticipantCount,
     #[error("viewing group contains a duplicate participant")]
     DuplicateParticipant,
+    #[error("DKG session id cannot be empty")]
+    EmptySessionId,
     #[error("not enough threshold responses")]
     InsufficientResponses,
     #[error("threshold response verification failed")]
@@ -72,6 +74,18 @@ impl DkgSession {
         validate_dkg_session_parts(threshold, &participants)?;
 
         let session_id = deterministic_dkg_session_id(viewing_group_id, threshold, &participants);
+
+        Self::with_session_id(viewing_group_id, threshold, participants, session_id)
+    }
+
+    pub fn with_session_id(
+        viewing_group_id: Word,
+        threshold: u16,
+        participants: Vec<DkgParticipant>,
+        session_id: Vec<u8>,
+    ) -> Result<Self, ThresholdError> {
+        validate_dkg_session_parts(threshold, &participants)?;
+        validate_session_id(&session_id)?;
 
         Ok(Self {
             viewing_group_id,
@@ -328,7 +342,8 @@ pub(crate) fn validate_viewing_parties(
 }
 
 pub(crate) fn validate_dkg_session(session: &DkgSession) -> Result<(), ThresholdError> {
-    validate_dkg_session_parts(session.threshold, &session.participants)
+    validate_dkg_session_parts(session.threshold, &session.participants)?;
+    validate_session_id(&session.session_id)
 }
 
 fn validate_dkg_session_parts(
@@ -345,6 +360,14 @@ fn validate_dkg_session_parts(
     }
 
     Ok(())
+}
+
+fn validate_session_id(session_id: &[u8]) -> Result<(), ThresholdError> {
+    if session_id.is_empty() {
+        Err(ThresholdError::EmptySessionId)
+    } else {
+        Ok(())
+    }
 }
 
 fn deterministic_dkg_session_id(
@@ -410,12 +433,8 @@ impl Deserializable for DkgSession {
 
         validate_dkg_session_parts(threshold, &participants)
             .map_err(|err| DeserializationError::InvalidValue(err.to_string()))?;
-
-        let expected_session_id =
-            deterministic_dkg_session_id(viewing_group_id, threshold, &participants);
-        if session_id != expected_session_id {
-            return Err(DeserializationError::InvalidValue("invalid DKG session id".to_string()));
-        }
+        validate_session_id(&session_id)
+            .map_err(|err| DeserializationError::InvalidValue(err.to_string()))?;
 
         Ok(Self {
             viewing_group_id,
@@ -622,12 +641,13 @@ mod tests {
     }
 
     #[test]
-    fn dkg_session_deserialization_rejects_invalid_session_id() {
+    fn dkg_session_deserialization_rejects_empty_session_id() {
         let participants = vec![participant("party-1"), participant("party-2")];
-        let session = DkgSession::new(word(1), 2, participants).unwrap();
-        let mut bytes = session.to_bytes();
-        let last = bytes.last_mut().unwrap();
-        *last ^= 1;
+        let mut bytes = Vec::new();
+        word(1).write_into(&mut bytes);
+        bytes.write_u16(2);
+        participants.write_into(&mut bytes);
+        Vec::<u8>::new().write_into(&mut bytes);
 
         assert!(matches!(
             DkgSession::read_from_bytes(&bytes),
