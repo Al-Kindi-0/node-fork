@@ -172,7 +172,7 @@ impl BlockBuilder {
                 .input_notes()
                 .iter()
                 .cloned()
-                .filter_map(|note| note.header().map(NoteHeader::to_commitment))
+                .filter_map(|note| note.header().map(NoteHeader::id))
         });
         let block_references_iter =
             batch_iter.clone().map(Deref::deref).map(ProvenBatch::reference_block_num);
@@ -271,7 +271,7 @@ impl BlockBuilder {
             .map_err(BuildBlockError::StoreApplyBlockFailed)?;
 
         let (header, ..) = signed_block.into_parts();
-        mempool.lock().map_err(BuildBlockError::MempoolPoisoned)?.commit_block(header);
+        mempool.lock().map_err(BuildBlockError::MempoolPoisoned)?.commit_block(&header);
 
         Ok(())
     }

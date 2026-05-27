@@ -74,8 +74,8 @@ decimals     = 6
 # e.g. a max supply of `1e15` _base units_ and decimals set to `6`, will yield you a total supply
 # of `1e15/1e6 = 1e9` `FUZZY`s.
 max_supply   = 1_000_000_000_000_000
-# Storage mode of the faucet account.
-storage_mode = "public"
+# Account type of the faucet account.
+account_type = "public"
 
 
 [[wallet]]
@@ -83,10 +83,8 @@ storage_mode = "public"
 # The number is in _base units_, e.g. specifying `999 FUZZY` at 6 decimals would become
 # `999_000_000`.
 assets       = [{ amount = 999_000_000, symbol = "FUZZY" }]
-# Storage mode of the wallet account.
-storage_mode = "private"
-# The code of the account can be updated or not.
-# has_updatable_code = false # default value
+# Account type of the wallet account.
+account_type = "private"
 ```
 
 To include pre-built accounts (e.g. bridge or wrapped-asset faucets) in the genesis block, use
@@ -161,7 +159,6 @@ Each component can also be started as a standalone process. For example:
 # Start the store
 miden-node store start \
   --rpc.listen 0.0.0.0:50001 \
-  --ntx-builder.listen 0.0.0.0:50002 \
   --block-producer.listen 0.0.0.0:50003 \
   --data-directory /tmp/store
 
@@ -184,7 +181,7 @@ miden-node rpc start \
 # Start the network transaction builder
 miden-node ntx-builder start \
   --listen 0.0.0.0:50301 \
-  --store.url http://127.0.0.1:50002 \
+  --store.url http://127.0.0.1:50001 \
   --block-producer.url http://127.0.0.1:50201 \
   --validator.url http://127.0.0.1:50101 \
   --data-directory /tmp/ntx-builder

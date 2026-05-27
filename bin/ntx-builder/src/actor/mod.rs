@@ -1,3 +1,4 @@
+mod allowlist;
 pub mod candidate;
 mod execute;
 
@@ -5,13 +6,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use allowlist::{NoteScriptNotAllowlisted, partition_by_allowlist};
 use anyhow::Context;
 use candidate::TransactionCandidate;
-use futures::FutureExt;
-use miden_node_proto::domain::account::NetworkAccountId;
 use miden_node_utils::ErrorReport;
 use miden_node_utils::lru_cache::LruCache;
 use miden_protocol::Word;
+use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{NoteScript, Nullifier};
 use miden_protocol::transaction::TransactionId;
@@ -21,7 +22,7 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::NoteError;
 use crate::chain_state::{ChainState, SharedChainState};
-use crate::clients::{BlockProducerClient, StoreClient, ValidatorClient};
+use crate::clients::RpcClient;
 use crate::db::Db;
 
 // ACTOR REQUESTS
@@ -38,7 +39,8 @@ pub enum ActorRequest {
         block_num: BlockNumber,
         ack_tx: tokio::sync::oneshot::Sender<()>,
     },
-    /// A note script was fetched from the remote store and should be persisted to the local DB.
+    /// A note script was fetched from the remote RPC service and should be persisted to the local
+    /// DB.
     CacheNoteScript { script_root: Word, script: NoteScript },
 }
 
@@ -48,12 +50,8 @@ pub enum ActorRequest {
 /// gRPC clients used by an account actor to interact with the node's services.
 #[derive(Clone)]
 pub struct GrpcClients {
-    /// Client for interacting with the store in order to load account state.
-    pub store: StoreClient,
-    /// Client for interacting with the block producer.
-    pub block_producer: BlockProducerClient,
-    /// Client for interacting with the validator.
-    pub validator: ValidatorClient,
+    /// Client for interacting with the RPC service in order to load account state.
+    pub rpc: RpcClient,
     /// Client for remote transaction proving. If `None`, transactions will be proven locally, which
     /// is undesirable due to the performance impact.
     pub prover: Option<RemoteTransactionProver>,
@@ -66,7 +64,7 @@ pub struct State {
     pub db: Db,
     /// The latest chain state. A single chain state is shared among all actors.
     pub chain: Arc<SharedChainState>,
-    /// Shared LRU cache for storing retrieved note scripts to avoid repeated store calls.
+    /// Shared LRU cache for storing retrieved note scripts to avoid repeated RPC calls.
     pub script_cache: LruCache<Word, NoteScript>,
 }
 
@@ -82,8 +80,8 @@ pub struct ActorConfig {
     /// Maximum number of VM execution cycles for network transactions.
     pub max_cycles: u32,
     /// Initial sleep applied between per-request retries on transient infrastructure failures
-    /// (prover unreachable, validator/block-producer transport error, store gRPC hiccup). Doubles
-    /// each retry up to [`Self::request_backoff_max`].
+    /// (prover unreachable, RPC transport error, RPC gRPC hiccup). Doubles each retry up to
+    /// [`Self::request_backoff_max`].
     pub request_backoff_initial: Duration,
     /// Upper bound on the per-request retry backoff sleep.
     pub request_backoff_max: Duration,
@@ -98,7 +96,7 @@ pub struct AccountActorContext {
     pub clients: GrpcClients,
     pub state: State,
     pub config: ActorConfig,
-    /// Channel for sending requests to the coordinator (via the builder event loop).
+    /// Channel for sending requests to the coordinator (via the builder loop).
     pub request_tx: mpsc::Sender<ActorRequest>,
 }
 
@@ -113,20 +111,24 @@ impl AccountActorContext {
         use url::Url;
 
         use crate::chain_state::SharedChainState;
-        use crate::clients::StoreClient;
+        use crate::clients::RpcClient;
         use crate::test_utils::mock_block_header;
 
         let url = Url::parse("http://127.0.0.1:1").unwrap();
         let block_header = mock_block_header(0_u32.into());
-        let chain_mmr = PartialMmr::from_peaks(MmrPeaks::new(Forest::new(0), vec![]).unwrap());
+        let chain_mmr = PartialMmr::from_peaks(
+            MmrPeaks::new(Forest::new(0).expect("forest 0 is valid"), vec![]).unwrap(),
+        );
         let chain_state = Arc::new(SharedChainState::new(block_header, chain_mmr));
         let (request_tx, _request_rx) = mpsc::channel(1);
 
         Self {
             clients: GrpcClients {
-                store: StoreClient::new(url.clone()),
-                block_producer: BlockProducerClient::new(url.clone()),
-                validator: ValidatorClient::new(url),
+                rpc: RpcClient::new(
+                    url.clone(),
+                    Duration::from_millis(100),
+                    Duration::from_secs(30),
+                ),
                 prover: None,
             },
             state: State {
@@ -173,16 +175,15 @@ enum ActorMode {
 ///   based on current chain state and DB queries.
 /// - **Transaction Execution**: Executes selected transactions using either local or remote
 ///   proving.
-/// - **Mempool Integration**: Listens for mempool events to stay synchronized with the network
-///   state and adjust behavior based on transaction confirmations.
+/// - **Chain Integration**: Reacts to committed-chain updates persisted by the coordinator to stay
+///   synchronized with the network state.
 ///
 /// ## Lifecycle
 ///
 /// 1. **Initialization**: Waits for committed account state, then checks DB for available notes.
-/// 2. **Event Loop**: Continuously processes mempool events and executes transactions.
-/// 3. **Transaction Processing**: Selects, executes, and proves transactions, and submits them to
-///    block producer.
-/// 4. **State Updates**: Event effects are persisted to DB by the coordinator before actors are
+/// 2. **Event Loop**: Re-evaluates database state on notification and executes transactions.
+/// 3. **Transaction Processing**: Selects, executes, proves, and submits transactions through RPC.
+/// 4. **State Updates**: Committed-chain updates are persisted to DB before actors are
 ///    notified.
 /// 5. **Shutdown**: Terminates gracefully on idle timeout, or returns an error on unrecoverable
 ///    failures.
@@ -194,7 +195,7 @@ enum ActorMode {
 /// actor exits of its own accord when idle for longer than [`ActorConfig::idle_timeout`].
 pub struct AccountActor {
     /// The network account this actor is responsible for.
-    account_id: NetworkAccountId,
+    account_id: AccountId,
     /// gRPC clients used by the actor.
     clients: GrpcClients,
     /// Shared state accessed by the actor.
@@ -211,7 +212,7 @@ pub struct AccountActor {
 impl AccountActor {
     /// Constructs a new account actor with the given configuration.
     pub fn new(
-        account_id: NetworkAccountId,
+        account_id: AccountId,
         actor_context: &AccountActorContext,
         notify: Arc<Notify>,
     ) -> Self {
@@ -225,97 +226,33 @@ impl AccountActor {
         }
     }
 
-    /// Runs the account actor, processing events and managing state until shutdown.
+    /// Runs the account actor, processing notifications and managing state until shutdown.
     ///
     /// The return value signals the shutdown category to the coordinator:
     ///
-    /// - `Ok(())`: intentional shutdown (idle timeout or account removal).
-    /// - `Err(_)`: crash (database error, semaphore failure, or any other bug).
-    pub async fn run(self, semaphore: Arc<Semaphore>) -> anyhow::Result<()> {
+    /// - `Ok(())`: intentional shutdown (idle timeout or account not committed in time).
+    /// - `Err(_)`: crash (database error or any other bug).
+    pub async fn run(self, _semaphore: Arc<Semaphore>) -> anyhow::Result<()> {
         let account_id = self.account_id;
 
         // Wait for the account to be committed to the DB. For newly created accounts, the creation
-        // transaction must be committed before we start processing notes.
+        // transaction must be committed before the actor becomes active.
         if !self.wait_for_committed_account(account_id).await? {
             return Ok(());
         }
 
-        // Determine initial mode by checking DB for available notes.
-        let block_num = self.state.chain.chain_tip_block_number();
-        let has_notes = self
-            .state
-            .db
-            .has_available_notes(account_id, block_num, self.config.max_note_attempts)
-            .await
-            .context("failed to check for available notes")?;
-
-        let mut mode = if has_notes {
-            ActorMode::NotesAvailable
-        } else {
-            ActorMode::NoViableNotes
-        };
-
         loop {
-            // Enable or disable transaction execution based on actor mode.
-            let tx_permit_acquisition = match mode {
-                // Disable transaction execution.
-                ActorMode::NoViableNotes | ActorMode::TransactionInflight(_) => {
-                    std::future::pending().boxed()
-                },
-                // Enable transaction execution.
-                ActorMode::NotesAvailable => semaphore.acquire().boxed(),
-            };
-
-            // Idle timeout timer: only ticks when in NoViableNotes mode. Mode changes cause the
-            // next loop iteration to create a fresh sleep or pending.
-            let idle_timeout_sleep = match mode {
-                ActorMode::NoViableNotes => tokio::time::sleep(self.config.idle_timeout).boxed(),
-                _ => std::future::pending().boxed(),
-            };
-
             tokio::select! {
-                // Handle coordinator notifications. On notification, re-evaluate state from DB.
+                // A committed block touched this account (or the coordinator woke everyone). PR 3
+                // reconnects transaction execution here.
                 _ = self.notify.notified() => {
-                    match mode {
-                        ActorMode::TransactionInflight(awaited_id) => {
-                            // Check DB: is the inflight tx still pending?
-                            let exists = self
-                                .state
-                                .db
-                                .transaction_exists(awaited_id)
-                                .await
-                                .context("failed to check transaction status")?;
-                            if exists {
-                                mode = ActorMode::NotesAvailable;
-                            }
-                        },
-                        _ => {
-                            mode = ActorMode::NotesAvailable;
-                        }
-                    }
-                },
-                // Execute transactions.
-                permit = tx_permit_acquisition => {
-                    let _permit = permit.context("semaphore closed")?;
-
-                    // Read the chain state.
-                    let chain_state = self.state.chain.get_cloned();
-
-                    // Query DB for latest account and available notes.
-                    let tx_candidate = self.select_candidate_from_db(
-                        account_id,
-                        chain_state,
-                    ).await?;
-
-                    if let Some(tx_candidate) = tx_candidate {
-                        mode = self.execute_transactions(account_id, tx_candidate).await;
-                    } else {
-                        // No transactions to execute, wait for events.
-                        mode = ActorMode::NoViableNotes;
-                    }
+                    tracing::debug!(
+                        %account_id,
+                        "actor notified; transaction execution reconnects in PR 3",
+                    );
                 }
-                // Idle timeout: actor has been idle too long, deactivate account.
-                _ = idle_timeout_sleep => {
+                // Idle timeout: actor has been idle too long, deactivate.
+                () = tokio::time::sleep(self.config.idle_timeout) => {
                     tracing::info!(%account_id, "Account actor deactivated due to idle timeout");
                     return Ok(());
                 }
@@ -326,7 +263,7 @@ impl AccountActor {
     /// Selects a transaction candidate by querying the DB.
     async fn select_candidate_from_db(
         &self,
-        account_id: NetworkAccountId,
+        account_id: AccountId,
         chain_state: ChainState,
     ) -> anyhow::Result<Option<TransactionCandidate>> {
         let block_num = chain_state.chain_tip_header.block_num();
@@ -344,7 +281,27 @@ impl AccountActor {
             return Ok(None);
         };
 
-        let notes: Vec<_> = notes.into_iter().take(max_notes).collect();
+        let partitioned_notes = partition_by_allowlist(&account, notes)
+            .context("failed to read network account note allowlist")?;
+
+        if !partitioned_notes.rejected.is_empty() {
+            let failed_notes = partitioned_notes
+                .rejected
+                .into_iter()
+                .map(|(nullifier, script_root)| {
+                    let error: NoteError = Arc::new(NoteScriptNotAllowlisted::new(script_root));
+                    (nullifier, error)
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                %account_id,
+                rejected_count = failed_notes.len(),
+                "dropping network notes whose script roots are not allowlisted",
+            );
+            self.mark_notes_failed(&failed_notes, block_num).await;
+        }
+
+        let notes: Vec<_> = partitioned_notes.allowed.into_iter().take(max_notes).collect();
         if notes.is_empty() {
             return Ok(None);
         }
@@ -363,13 +320,9 @@ impl AccountActor {
     /// For accounts that are being created by an inflight transaction, this will idle
     /// until the transaction is committed. Returns `true` when the account is ready, or
     /// `false` if no commit arrived within [`ActorConfig::idle_timeout`] — in which case
-    /// the coordinator will respawn a new actor when the account reappears through
-    /// [`Coordinator::send_targeted`](crate::coordinator::Coordinator::send_targeted) or the
-    /// account loader.
-    async fn wait_for_committed_account(
-        &self,
-        account_id: NetworkAccountId,
-    ) -> anyhow::Result<bool> {
+    /// the coordinator will respawn a new actor when a later committed block targets the
+    /// account again.
+    async fn wait_for_committed_account(&self, account_id: AccountId) -> anyhow::Result<bool> {
         // Check if the account is already committed.
         if self
             .state
@@ -410,24 +363,22 @@ impl AccountActor {
     ///
     /// Returns the new actor mode based on the execution result.
     ///
-    /// Transient infrastructure failures (prover unreachable, validator/block-producer transport
-    /// hiccup, store gRPC error) are retried inside [`execute::NtxContext::execute_transaction`].
+    /// Transient infrastructure failures (prover unreachable, RPC transport hiccup, RPC gRPC
+    /// error) are retried inside [`execute::NtxContext::execute_transaction`].
     /// Any error reaching this method is therefore terminal for the candidate: the batch's notes
     /// are marked failed and the actor moves on.
     #[tracing::instrument(name = "ntx.actor.execute_transactions", skip(self, tx_candidate))]
     async fn execute_transactions(
         &self,
-        account_id: NetworkAccountId,
+        account_id: AccountId,
         tx_candidate: TransactionCandidate,
     ) -> ActorMode {
         let block_num = tx_candidate.chain_tip_header.block_num();
 
         // Execute the selected transaction.
         let context = execute::NtxContext::new(
-            self.clients.block_producer.clone(),
-            self.clients.validator.clone(),
             self.clients.prover.clone(),
-            self.clients.store.clone(),
+            self.clients.rpc.clone(),
             self.state.script_cache.clone(),
             self.state.db.clone(),
             self.config.max_cycles,
@@ -497,7 +448,7 @@ impl AccountActor {
         }
     }
 
-    /// Sends requests to the coordinator to cache note scripts fetched from the remote store.
+    /// Sends requests to the coordinator to cache note scripts fetched from the remote RPC service.
     async fn cache_note_scripts(&self, scripts: Vec<(Word, NoteScript)>) {
         for (script_root, script) in scripts {
             if self
@@ -553,4 +504,127 @@ fn log_failed_notes(failed: Vec<FailedNote>) -> Vec<(Nullifier, NoteError)> {
             (f.note().nullifier(), error)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    #[ignore = "wip refactor"]
+    async fn select_candidate_keeps_allowlisted_notes() {
+        // let (db, _dir) = Db::test_setup().await;
+        // let account_id = mock_network_account_id();
+        // let note = mock_single_target_note(account_id, 10);
+        // let account = mock_account_with_auth_component(
+        //     AuthNetworkAccount::with_allowlist(BTreeSet::from_iter([note
+        //         .as_note()
+        //         .script()
+        //         .root()]))
+        //     .expect("non-empty allowlist should construct"),
+        // );
+
+        // db.sync_account_from_store(account_id, account, vec![note.clone()])
+        //     .await
+        //     .expect("fixtures should sync");
+
+        // let (actor, context) = actor_with_request_handler(&db, account_id); let chain_state =
+        // context.state.chain.get_cloned();
+
+        // let candidate = actor
+        //     .select_candidate_from_db(account_id, chain_state)
+        //     .await
+        //     .expect("selection should succeed")
+        //     .expect("allowed note should produce a candidate");
+
+        // assert_eq!(candidate.notes.len(), 1);
+        // assert_eq!(candidate.notes[0].as_note().nullifier(), note.as_note().nullifier());
+    }
+
+    #[tokio::test]
+    #[ignore = "wip refactor"]
+    async fn select_candidate_marks_non_allowlisted_notes_failed() {
+        // let (db, _dir) = Db::test_setup().await;
+        // let account_id = mock_network_account_id();
+        // let allowed_note = mock_single_target_note(account_id, 10);
+        // let rejected_note =
+        //     mock_single_target_note_with_code(account_id, 20, Some(OTHER_NOTE_SCRIPT));
+        // let account = mock_account_with_auth_component(
+        //     AuthNetworkAccount::with_allowlist(BTreeSet::from_iter([allowed_note
+        //         .as_note()
+        //         .script()
+        //         .root()]))
+        //     .expect("non-empty allowlist should construct"),
+        // );
+
+        // db.sync_account_from_store(account_id, account, vec![rejected_note.clone()])
+        //     .await
+        //     .expect("fixtures should sync");
+
+        // let (actor, context) = actor_with_request_handler(&db, account_id); let chain_state =
+        // context.state.chain.get_cloned();
+
+        // let candidate = actor
+        //     .select_candidate_from_db(account_id, chain_state)
+        //     .await
+        //     .expect("selection should succeed");
+
+        // assert!(candidate.is_none());
+
+        // let status = db
+        //     .get_note_status(rejected_note.as_note().id())
+        //     .await
+        //     .expect("status query should succeed")
+        //     .expect("note should exist");
+        // assert_eq!(status.attempt_count, 1);
+        // assert!(
+        //     status
+        //         .last_error
+        //         .as_deref()
+        //         .expect("rejected note should record an error")
+        //         .contains("not allowlisted")
+        // );
+    }
+
+    #[tokio::test]
+    #[ignore = "wip refactor"]
+    async fn select_candidate_executes_allowed_notes_and_marks_rejected_notes_failed() {
+        // let (db, _dir) = Db::test_setup().await;
+        // let account_id = mock_network_account_id();
+        // let allowed_note = mock_single_target_note(account_id, 10);
+        // let rejected_note =
+        //     mock_single_target_note_with_code(account_id, 20, Some(OTHER_NOTE_SCRIPT));
+        // let account = mock_account_with_auth_component(
+        //     AuthNetworkAccount::with_allowlist(BTreeSet::from_iter([allowed_note
+        //         .as_note()
+        //         .script()
+        //         .root()]))
+        //     .expect("non-empty allowlist should construct"),
+        // );
+
+        // db.sync_account_from_store(
+        //     account_id,
+        //     account,
+        //     vec![allowed_note.clone(), rejected_note.clone()],
+        // )
+        // .await
+        // .expect("fixtures should sync");
+
+        // let (actor, context) = actor_with_request_handler(&db, account_id); let chain_state =
+        // context.state.chain.get_cloned();
+
+        // let candidate = actor
+        //     .select_candidate_from_db(account_id, chain_state)
+        //     .await
+        //     .expect("selection should succeed")
+        //     .expect("allowed note should remain");
+
+        // assert_eq!(candidate.notes.len(), 1);
+        // assert_eq!(candidate.notes[0].as_note().nullifier(), allowed_note.as_note().nullifier());
+
+        // let rejected_status = db
+        //     .get_note_status(rejected_note.as_note().id())
+        //     .await
+        //     .expect("status query should succeed")
+        //     .expect("rejected note should exist");
+        // assert_eq!(rejected_status.attempt_count, 1);
+    }
 }

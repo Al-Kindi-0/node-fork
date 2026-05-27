@@ -167,7 +167,7 @@ fn block_commit_reverts_expired_txns() {
     // Create and commit the block which should revert the above tx.
     let block = uut.select_block();
     let arb_header = BlockHeader::mock(block.block_number, None, None, &[], Word::empty());
-    uut.commit_block(arb_header.clone());
+    uut.commit_block(&arb_header);
 
     // A reverted transaction behaves as if it never existed.
     reference.add_transaction(tx_to_commit.clone()).unwrap();
@@ -176,7 +176,7 @@ fn block_commit_reverts_expired_txns() {
         tx_to_commit.raw_proven_transaction()
     ])));
     reference.select_block();
-    reference.commit_block(arb_header);
+    reference.commit_block(&arb_header);
 
     assert_eq!(uut, reference);
 }
@@ -188,7 +188,7 @@ fn empty_block_commitment() {
     for _ in 0..3 {
         let block = uut.select_block();
         let arb_header = BlockHeader::mock(block.block_number, None, None, &[], Word::empty());
-        uut.commit_block(arb_header);
+        uut.commit_block(&arb_header);
     }
 }
 
@@ -233,17 +233,17 @@ fn pruned_committed_notes_are_authenticated_for_inflight_descendants() {
 
     let block = uut.select_block();
     let header = BlockHeader::mock(block.block_number, None, None, &[], Word::empty());
-    uut.commit_block(header);
+    uut.commit_block(&header);
 
     let block = uut.select_block();
     let header = BlockHeader::mock(block.block_number, None, None, &[], Word::empty());
-    uut.commit_block(header);
+    uut.commit_block(&header);
 
     let child_batch = uut.select_batch().unwrap();
 
     assert_eq!(child_batch.transactions().len(), 1);
     assert_eq!(child_batch.transactions()[0].id(), child.id());
-    assert_eq!(child_batch.transactions()[0].unauthenticated_note_commitments().count(), 0);
+    assert_eq!(child_batch.transactions()[0].unauthenticated_note_ids().count(), 0);
     assert_eq!(child_batch.unauthenticated_note_commitments().count(), 0);
 }
 
@@ -251,7 +251,7 @@ fn pruned_committed_notes_are_authenticated_for_inflight_descendants() {
 #[should_panic]
 fn block_commitment_is_rejected_if_no_block_is_in_flight() {
     let arb_header = BlockHeader::mock(0, None, None, &[], Word::empty());
-    Mempool::for_tests().0.commit_block(arb_header);
+    Mempool::for_tests().0.commit_block(&arb_header);
 }
 
 #[test]

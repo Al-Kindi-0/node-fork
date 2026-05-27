@@ -319,7 +319,6 @@ impl State {
                     block_num,
                     note_index,
                     note_id: note.id().as_word(),
-                    note_commitment: note.to_commitment(),
                     metadata: *note.metadata(),
                     details,
                     attachments,
