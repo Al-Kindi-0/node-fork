@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
+use miden_node_rpc::PrivateTxSubmissionConfig;
 use miden_node_utils::clap::{
     GrpcOptionsExternal,
     GrpcOptionsInternal,
@@ -23,6 +24,19 @@ pub struct RpcOptions {
 
     #[command(flatten)]
     pub rate_limit: RpcRateLimitOptions,
+
+    /// Allows encrypted private transaction payloads to pass through the RPC to the validator.
+    ///
+    /// RPC does not decrypt private payloads. The validator must be configured separately for
+    /// private transaction submission.
+    #[arg(
+        long = "rpc.private-tx.enabled",
+        env = "MIDEN_NODE_RPC_PRIVATE_TX_ENABLED",
+        default_value_t = false,
+        value_name = "BOOL",
+        help_heading = super::section::RPC_CONFIGURATION_HELP_HEADING
+    )]
+    pub private_tx_enabled: bool,
 }
 
 impl RpcOptions {
@@ -33,6 +47,14 @@ impl RpcOptions {
             burst_size: self.rate_limit.burst_size,
             replenish_n_per_second_per_ip: self.rate_limit.replenish_per_second,
             max_concurrent_connections: self.rate_limit.max_concurrent_connections,
+        }
+    }
+
+    pub(super) fn private_tx_submission(&self) -> PrivateTxSubmissionConfig {
+        if self.private_tx_enabled {
+            PrivateTxSubmissionConfig::Private
+        } else {
+            PrivateTxSubmissionConfig::Public
         }
     }
 }

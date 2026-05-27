@@ -43,7 +43,7 @@ use tokio::task;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::Rpc;
+use crate::{PrivateTxSubmissionConfig, Rpc};
 
 /// A wrapper around the store runtime and data directory.
 ///
@@ -609,6 +609,7 @@ async fn start_rpc_with_options(
             validator_url,
             ntx_builder_url: None,
             grpc_options,
+            private_tx_submission: PrivateTxSubmissionConfig::Public,
         }
         .serve()
         .await

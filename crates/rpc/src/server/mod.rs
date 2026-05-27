@@ -37,6 +37,7 @@ pub struct Rpc {
     pub validator_url: Url,
     pub ntx_builder_url: Option<Url>,
     pub grpc_options: GrpcOptionsExternal,
+    pub private_tx_submission: PrivateTxSubmissionConfig,
 }
 
 impl Rpc {
@@ -51,6 +52,7 @@ impl Rpc {
             self.validator_url,
             self.ntx_builder_url.clone(),
             NonZeroUsize::new(1_000_000).unwrap(),
+            self.private_tx_submission,
         );
 
         let genesis = api
@@ -110,4 +112,14 @@ impl Rpc {
             .await
             .context("failed to serve RPC API")
     }
+}
+
+/// RPC policy for private transaction submissions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PrivateTxSubmissionConfig {
+    /// Reject encrypted private payloads at the public RPC boundary.
+    #[default]
+    Public,
+    /// Forward encrypted private payloads opaquely to the validator.
+    Private,
 }

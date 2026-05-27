@@ -44,6 +44,7 @@ use tonic::{IntoRequest, Request, Response, Status};
 use tracing::{Span, debug, info, info_span};
 use url::Url;
 
+use super::PrivateTxSubmissionConfig;
 use crate::COMPONENT;
 
 // RPC SERVICE
@@ -66,6 +67,7 @@ impl RpcService {
         validator_url: Url,
         ntx_builder_url: Option<Url>,
         commitment_cache_capacity: NonZeroUsize,
+        private_tx_submission: PrivateTxSubmissionConfig,
     ) -> Self {
         let store = {
             info!(target: COMPONENT, store_endpoint = %store_url, "Initializing store client");
@@ -130,7 +132,7 @@ impl RpcService {
             ntx_builder,
             genesis_commitment: None,
             block_commitment_cache: LruCache::new(commitment_cache_capacity),
-            private_tx_submission: PrivateTxSubmissionMode::Public,
+            private_tx_submission: private_tx_submission.into(),
         }
     }
 
@@ -733,9 +735,16 @@ impl api_server::Api for RpcService {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrivateTxSubmissionMode {
     Public,
-    // Constructed once RPC private-mode config is wired.
-    #[allow(dead_code)]
     Private,
+}
+
+impl From<PrivateTxSubmissionConfig> for PrivateTxSubmissionMode {
+    fn from(config: PrivateTxSubmissionConfig) -> Self {
+        match config {
+            PrivateTxSubmissionConfig::Public => Self::Public,
+            PrivateTxSubmissionConfig::Private => Self::Private,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -759,7 +768,10 @@ impl PrivateInputCarrier {
         }
     }
 
-    fn reject_if_private_mode_disabled(&self, mode: &PrivateTxSubmissionMode) -> Result<(), Status> {
+    fn reject_if_private_mode_disabled(
+        &self,
+        mode: &PrivateTxSubmissionMode,
+    ) -> Result<(), Status> {
         if matches!(self, Self::Encrypted) && matches!(mode, PrivateTxSubmissionMode::Public) {
             return Err(encrypted_private_payload_unsupported());
         }
@@ -925,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_mode_submit_proven_tx_rejects_encrypted_payload_before_transaction_decode() {
-        let service = rpc_service_with_block_producer();
+        let service = rpc_service_with_block_producer(PrivateTxSubmissionConfig::Public);
         let request = request_with_encrypted_payload(None);
 
         let err = <RpcService as Api>::submit_proven_tx(&service, Request::new(request))
@@ -933,6 +945,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("Encrypted private payloads"));
+    }
+
+    #[tokio::test]
+    async fn private_mode_submit_proven_tx_accepts_encrypted_payload_before_transaction_decode() {
+        let service = rpc_service_with_block_producer(PrivateTxSubmissionConfig::Private);
+        let request = request_with_encrypted_payload(None);
+
+        let err = <RpcService as Api>::submit_proven_tx(&service, Request::new(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("invalid transaction"));
+        assert!(!err.message().contains("Encrypted private payloads"));
     }
 
     fn request_with_encrypted_payload(
@@ -945,8 +971,10 @@ mod tests {
         }
     }
 
-    fn rpc_service_with_block_producer() -> RpcService {
-        // These endpoints are intentionally unreachable; encrypted payloads must be rejected
+    fn rpc_service_with_block_producer(
+        private_tx_submission: PrivateTxSubmissionConfig,
+    ) -> RpcService {
+        // These endpoints are intentionally unreachable; these tests assert request handling
         // before any network call is made.
         RpcService::new(
             Url::parse("http://127.0.0.1:1").expect("valid store URL"),
@@ -954,6 +982,7 @@ mod tests {
             Url::parse("http://127.0.0.1:3").expect("valid validator URL"),
             None,
             NonZeroUsize::new(1).expect("non-zero cache capacity"),
+            private_tx_submission,
         )
     }
 }

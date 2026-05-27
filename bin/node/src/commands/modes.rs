@@ -36,6 +36,7 @@ impl SequencerCommand {
             runtime.database_options,
             runtime.internal_grpc_options,
             runtime.external_grpc_options,
+            runtime.rpc_private_tx_submission,
             runtime.storage_options,
             self.block_producer.block.max_concurrent_proofs,
         );
@@ -79,6 +80,7 @@ impl FullNodeCommand {
             runtime.database_options,
             runtime.internal_grpc_options,
             runtime.external_grpc_options,
+            runtime.rpc_private_tx_submission,
             runtime.storage_options,
             self.sync.block_source_url,
         );

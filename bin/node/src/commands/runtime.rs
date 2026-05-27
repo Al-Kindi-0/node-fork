@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use miden_node_rpc::PrivateTxSubmissionConfig;
 use miden_node_store::DatabaseOptions;
 use miden_node_utils::clap::{GrpcOptionsExternal, GrpcOptionsInternal, StorageOptions};
 use miden_node_utils::logging::OpenTelemetry;
@@ -50,6 +51,7 @@ impl RuntimeOptions {
             database_options: store.sqlite.database_options(),
             internal_grpc_options: self.rpc.grpc.internal_grpc_options(),
             external_grpc_options: self.rpc.external_grpc_options(),
+            rpc_private_tx_submission: self.rpc.private_tx_submission(),
             storage_options: store.storage.clone().into(),
         }
     }
@@ -62,5 +64,6 @@ pub(super) struct RuntimeConfig {
     pub database_options: DatabaseOptions,
     pub internal_grpc_options: GrpcOptionsInternal,
     pub external_grpc_options: GrpcOptionsExternal,
+    pub rpc_private_tx_submission: PrivateTxSubmissionConfig,
     pub storage_options: StorageOptions,
 }
