@@ -90,7 +90,7 @@ The MVP assumptions are deliberately narrow:
 - `audit.rs` contains the reusable in-process audit helper.
 - `wire.rs` owns golden-backed serialization.
 - `compat.rs` contains the current golden-rs compatibility shim.
-- `examples/private_validator_demo.rs` runs the happy-path PoC without starting node services.
+- `examples/private_validator_demo.rs` runs the in-process PoC without starting node services.
 
 ## Running the Demo
 
@@ -112,23 +112,46 @@ Run the in-process demo:
 cargo run -p miden-node-private-tx-golden --example private_validator_demo
 ```
 
+Run the narrated Tier 2 demo:
+
+```bash
+cargo run -p miden-node-private-tx-golden --example private_validator_demo -- --narrated
+```
+
+Run the interactive Tier 2 demo:
+
+```bash
+cargo run -p miden-node-private-tx-golden --example private_validator_demo -- --interactive
+```
+
+For live presentation, add `--pause` to wait between stages. For slide data, use `--json`.
+Narrated and JSON modes also run the audit-coordination contrast: a happy audit leaves bonds intact,
+while a missed response triggers mock slashing.
+Interactive mode prompts for audit-party behavior: everyone responds, one representative party does
+not respond, or too few parties respond. For repeatable rehearsals, script it with
+`--scenario=all`, `--scenario=one-missing`, or `--scenario=below-threshold`.
+
+Narrated output includes small terminal visuals for sealed payloads, actor views, threshold
+responses, and bond settlement. It uses ANSI color when stdout is a terminal. Use `--no-color` to
+disable color, or `--color=always` when recording through a wrapper that hides terminal detection.
+
 Sample output captured on 2026-05-27:
 
 ```text
 private validator golden-rs demo
 participants=3 threshold=2
-submission_payload_bytes=181
-archive_record_bytes=973
-archive_ciphertext_bytes=265
+submission_payload_bytes=203
+archive_record_bytes=994
+archive_ciphertext_bytes=286
 wrapped_key_bytes=444
 audit_responses_count=2
 audit_response_bytes_total=776
 audit_response_bytes_avg=388
-dkg_ms=1164
+dkg_ms=2475
 client_encrypt_ms=0
-validator_archive_ms=22
-audit_decrypt_ms=104
-total_ms=1292
+validator_archive_ms=24
+audit_decrypt_ms=110
+total_ms=2610
 ```
 
 The timings are machine-dependent; byte counts should stay stable unless the envelope or wire format
@@ -139,7 +162,8 @@ changes.
 - `participants` / `threshold`: viewing group shape used by the demo.
 - `submission_payload_bytes`: serialized encrypted client-to-validator private payload.
 - `archive_record_bytes`: serialized encrypted archive record stored by the validator.
-- `archive_ciphertext_bytes`: AEAD ciphertext for the archived private transaction record.
+- `archive_ciphertext_bytes`: AEAD ciphertext for the sealed `PrivateTxRecord`, including the
+  private note payload and archive metadata, but not the outer archive envelope or wrapped key.
 - `wrapped_key_bytes`: threshold-wrapped per-transaction archive key.
 - `audit_responses_count`: threshold responses combined by the auditor. Equals threshold on a
   successful ceremony.
@@ -148,6 +172,9 @@ changes.
 - `client_encrypt_ms`: client-side payload encryption time.
 - `validator_archive_ms`: decrypt, archive encrypt, and threshold wrap time.
 - `audit_decrypt_ms`: audit response production, verification, combine, and archive open time.
+- `coordination`: JSON-only metrics for the Tier 2 audit-coordination contrast. The happy path
+  shows all parties responding with no slashing; the missed-response path shows one party's mock
+  bond decreasing from `100` to `90`.
 - `total_ms`: full in-process demo wall-clock time.
 
 ## Validation Coverage
