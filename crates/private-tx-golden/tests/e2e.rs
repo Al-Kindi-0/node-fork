@@ -1,9 +1,11 @@
 use miden_node_private_tx::{
-    ArchiveAssociatedData, ArchiveRecordKey, ChainId, EncryptedPrivateTxRecord, PRIVATE_TX_VERSION,
-    PrivateTxRecord, PrivateTxRecordMetadata, ThresholdError, ThresholdRecordEncryptor,
-    ThresholdShareCombiner, ThresholdShareProducer, ThresholdShareVerifier, ValidatorId,
-    ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare, ViewingPartyId,
-    ViewingPartyPublicShare, archive_associated_data, private_tx_record_identity,
+    ArchiveAssociatedData, ArchiveRecordAssociatedData, ArchiveRecordKey, AuditCoordinator,
+    AuditRequest, AuditTransportPublicKey, AuditorId, ChainId, EncryptedPrivateTxRecord,
+    InMemoryAuditCoordinator, PRIVATE_TX_VERSION, PrivateTxRecord, PrivateTxRecordMetadata,
+    ThresholdError, ThresholdRecordEncryptor, ThresholdShareCombiner, ThresholdShareProducer,
+    ThresholdShareVerifier, ValidatorId, ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare,
+    ViewingPartyId, ViewingPartyPublicShare, archive_associated_data,
+    archive_associated_data_for_record, open_private_tx_record, private_tx_record_identity,
     seal_private_tx_record,
 };
 use miden_node_private_tx_golden::{
@@ -170,6 +172,142 @@ fn golden_audit_orchestrator_rejects_zero_threshold() {
     }
 }
 
+#[test]
+fn audit_coordination_drives_golden_audit_flow_to_completion() {
+    let adapter = GoldenThresholdAdapter;
+    let viewing_group = setup_viewing_group(&adapter);
+    let (encrypted_record, expected_record) = archive_record(&adapter, &viewing_group);
+    let coordinator = InMemoryAuditCoordinator::new(100);
+    let auditor_id = AuditorId::new("auditor-1").unwrap();
+    coordinator.authorize_auditor(auditor_id.clone()).unwrap();
+
+    let (transport_public_key, transport_secret) =
+        GoldenThresholdAdapter::audit_transport_keypair();
+    let request = audit_request(
+        auditor_id.clone(),
+        &encrypted_record,
+        &viewing_group,
+        transport_public_key.clone(),
+        105,
+    );
+    let request_id = coordinator.request_audit(request).unwrap();
+    let archive_ad = archive_associated_data_for_record(ArchiveRecordAssociatedData {
+        record: &encrypted_record,
+    });
+
+    for key_share in &viewing_group.key_shares {
+        let response = adapter
+            .produce_decryption_response(
+                key_share,
+                &encrypted_record.identity,
+                &archive_ad,
+                &transport_public_key,
+                &encrypted_record.data_key_protection,
+            )
+            .unwrap();
+        coordinator.submit_response(request_id, &key_share.party_id, response).unwrap();
+    }
+
+    let responses = coordinator.fetch_responses(request_id).unwrap();
+    assert_eq!(responses.responses.len(), viewing_group.key_shares.len());
+    for response in &responses.responses {
+        adapter
+            .verify_decryption_response(
+                response,
+                &encrypted_record.identity,
+                &archive_ad,
+                &transport_public_key,
+                public_share_for(&viewing_group.public_shares, &response.party_id),
+            )
+            .unwrap();
+    }
+
+    let threshold_responses = usize::from(viewing_group.threshold);
+    let unlock = adapter
+        .combine_responses(
+            &encrypted_record.data_key_protection,
+            &responses.responses[..threshold_responses],
+            viewing_group.threshold,
+            &encrypted_record.identity,
+            &archive_ad,
+            &transport_secret,
+        )
+        .unwrap();
+    let record_key = ArchiveRecordKey::from_bytes(&unlock.record_key).unwrap();
+    let plaintext =
+        open_private_tx_record(&record_key, &encrypted_record.record_ciphertext, &archive_ad)
+            .unwrap();
+    assert_eq!(PrivateTxRecord::read_from_bytes(&plaintext).unwrap(), expected_record);
+
+    coordinator.advance_block(5).unwrap();
+    let settlement = coordinator.settle(request_id).unwrap();
+    assert_eq!(settlement.responded_parties.len(), viewing_group.key_shares.len());
+    assert!(settlement.slashed_parties.is_empty());
+}
+
+#[test]
+fn audit_coordination_settles_below_threshold_with_slashing() {
+    let adapter = GoldenThresholdAdapter;
+    let viewing_group = setup_viewing_group(&adapter);
+    let (encrypted_record, _) = archive_record(&adapter, &viewing_group);
+    let coordinator = InMemoryAuditCoordinator::new(100);
+    let auditor_id = AuditorId::new("auditor-1").unwrap();
+    coordinator.authorize_auditor(auditor_id.clone()).unwrap();
+
+    let (transport_public_key, transport_secret) =
+        GoldenThresholdAdapter::audit_transport_keypair();
+    let request = audit_request(
+        auditor_id,
+        &encrypted_record,
+        &viewing_group,
+        transport_public_key.clone(),
+        106,
+    );
+    let request_id = coordinator.request_audit(request).unwrap();
+    let archive_ad = archive_associated_data_for_record(ArchiveRecordAssociatedData {
+        record: &encrypted_record,
+    });
+    let key_share = &viewing_group.key_shares[0];
+    let response = adapter
+        .produce_decryption_response(
+            key_share,
+            &encrypted_record.identity,
+            &archive_ad,
+            &transport_public_key,
+            &encrypted_record.data_key_protection,
+        )
+        .unwrap();
+    coordinator.submit_response(request_id, &key_share.party_id, response).unwrap();
+
+    let responses = coordinator.fetch_responses(request_id).unwrap();
+    assert_eq!(
+        adapter
+            .combine_responses(
+                &encrypted_record.data_key_protection,
+                &responses.responses,
+                viewing_group.threshold,
+                &encrypted_record.identity,
+                &archive_ad,
+                &transport_secret,
+            )
+            .unwrap_err(),
+        ThresholdError::InsufficientResponses
+    );
+
+    coordinator.advance_block(6).unwrap();
+    let settlement = coordinator.settle(request_id).unwrap();
+    assert_eq!(settlement.responded_parties, vec![key_share.party_id.clone()]);
+    assert_eq!(
+        settlement.slashed_parties,
+        viewing_group
+            .key_shares
+            .iter()
+            .skip(1)
+            .map(|share| share.party_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 struct ViewingGroup {
     threshold: u16,
     group_public_key: ViewingGroupPublicKey,
@@ -305,6 +443,34 @@ fn archive_record(
         },
         private_record,
     )
+}
+
+fn audit_request(
+    auditor_id: AuditorId,
+    encrypted_record: &EncryptedPrivateTxRecord,
+    viewing_group: &ViewingGroup,
+    transport_public_key: AuditTransportPublicKey,
+    deadline_block: u64,
+) -> AuditRequest {
+    AuditRequest {
+        auditor_id,
+        tx_id: encrypted_record.tx_id,
+        viewing_group_id: encrypted_record.viewing_group_id,
+        identity: encrypted_record.identity.clone(),
+        transport_public_key,
+        parties: viewing_group.key_shares.iter().map(|share| share.party_id.clone()).collect(),
+        deadline_block,
+    }
+}
+
+fn public_share_for<'a>(
+    public_shares: &'a [ViewingPartyPublicShare],
+    party_id: &ViewingPartyId,
+) -> &'a ViewingPartyPublicShare {
+    public_shares
+        .iter()
+        .find(|public_share| &public_share.party_id == party_id)
+        .unwrap()
 }
 
 fn tx_id(seed: u32) -> TransactionId {

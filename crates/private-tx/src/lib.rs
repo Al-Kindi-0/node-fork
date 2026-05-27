@@ -6,6 +6,7 @@
 //! for `miden-protocol`.
 
 pub mod associated_data;
+pub mod audit_coordination;
 pub mod encryption;
 pub mod envelope;
 pub mod mock;
@@ -21,6 +22,10 @@ pub use associated_data::{
     SubmissionPayloadAssociatedData, archive_associated_data, archive_associated_data_for_record,
     private_tx_record_identity, submission_associated_data_for_encryption,
     submission_associated_data_for_payload,
+};
+pub use audit_coordination::{
+    AuditCoordinationError, AuditCoordinator, AuditRequest, AuditRequestId, AuditRequestStatus,
+    AuditResponses, AuditSettlement, InMemoryAuditCoordinator, PendingAuditRequest,
 };
 pub use encryption::{
     ArchiveRecordKey, PrivateTxEncryptionError, decrypt_submission_payload,
@@ -41,6 +46,6 @@ pub use threshold::{
     ViewingGroupSetup, ViewingKeyShare, ViewingPartyPublicShare,
 };
 pub use types::{
-    ChainId, EncryptionSchemeId, PRIVATE_TX_VERSION, TeeSchemeId, ThresholdSchemeId, ValidatorId,
-    ViewingPartyId,
+    AuditorId, ChainId, EncryptionSchemeId, PRIVATE_TX_VERSION, TeeSchemeId, ThresholdSchemeId,
+    ValidatorId, ViewingPartyId,
 };

@@ -26,10 +26,14 @@ The PoC proves the architecture end to end with real crypto:
 - Validator archive encryption uses `miden_crypto` XChaCha20-Poly1305 with associated data.
 - Threshold DKG uses golden-rs DKG setup, dealing verification, and completion.
 - Record-key wrapping and audit recovery use golden-rs vetKeys IBE.
+- RPC accepts encrypted private payloads in private mode (`--rpc.private-tx.enabled`) and forwards
+  them opaquely; the validator owns decryption.
 - Validator private mode loads an unsealing key and viewing group public key from config.
 - The validator stores encrypted archive records in SQLite.
 - `GetPrivateTxArchiveRecord` returns a serialized `EncryptedPrivateTxRecord` by transaction ID.
 - `decrypt_private_tx_archive_record` runs the in-process audit ceremony and opens the archive.
+- `AuditCoordinator` models L1-style audit requests, response collection, and non-responder
+  settlement with an in-memory PoC backend.
 - Adapter-owned wire bytes are domain-separated and versioned; golden-rs structs do not cross the
   crate boundary.
 
@@ -41,6 +45,9 @@ The PoC proves the architecture end to end with real crypto:
   custody rules, jurisdictional constraints, and an audit authorization mechanism.
 - Audit parties are modeled in-process. Production needs a request/response protocol for threshold
   parties.
+- No production binary launches the RPC server today; private-mode RPC behavior is verified at the
+  handler level. A full RPC-to-validator submission test still needs a real proven transaction
+  fixture or a proof-verification test seam.
 - Validator encryption-key discovery is manual/config-file based. Production needs an authenticated
   discovery mechanism, such as an on-chain registry or signed metadata.
 - DKG setup in tests and the demo uses local helper code for a 3-party, threshold-2 group. A
@@ -55,6 +62,22 @@ The PoC proves the architecture end to end with real crypto:
 - Archived private-record size limits and retention policy are not implemented.
 - CPU-heavy threshold wrapping and audit work run in-process. Production should move this work onto
   blocking worker threads.
+
+## Audit Coordination Sketch
+
+The base `miden-node-private-tx` crate exposes `AuditCoordinator` as a small L1-like coordination
+surface. The PoC `InMemoryAuditCoordinator` lets an authorized auditor request an audit for one
+`tx_id`, publish an ephemeral audit transport key, collect threshold-party responses before a block
+deadline, and settle the request after the deadline.
+
+The MVP assumptions are deliberately narrow:
+
+- Auditors are assumed honest and pay their own gas. Auditor bonding is deferred.
+- Auditor whitelist admission is a governance question outside the trait.
+- Settlement slashes non-submission only. Invalid-but-submitted responses require a v2 fraud-proof
+  path.
+- L1 anchoring economically discourages off-chain collusion, but it does not cryptographically
+  prevent a threshold quorum from colluding outside the protocol.
 
 ## Code Layout
 

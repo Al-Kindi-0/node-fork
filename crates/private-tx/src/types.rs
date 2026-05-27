@@ -61,6 +61,7 @@ pub enum IdentifierError {
 }
 
 string_id!(ChainId, "chain id");
+string_id!(AuditorId, "auditor id");
 string_id!(ValidatorId, "validator id");
 string_id!(ViewingPartyId, "viewing party id");
 
@@ -112,6 +113,7 @@ mod tests {
     #[test]
     fn string_ids_reject_empty_values() {
         assert_eq!(ChainId::new("").unwrap_err(), IdentifierError::Empty("chain id"));
+        assert_eq!(AuditorId::new("").unwrap_err(), IdentifierError::Empty("auditor id"));
         assert_eq!(ValidatorId::new("").unwrap_err(), IdentifierError::Empty("validator id"));
         assert_eq!(
             ViewingPartyId::new("").unwrap_err(),
