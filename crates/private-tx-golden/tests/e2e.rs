@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use miden_node_private_tx::{
     ArchiveAssociatedData, ArchiveRecordAssociatedData, ArchiveRecordKey, AuditCoordinator,
     AuditRequest, AuditTransportPublicKey, AuditorId, ChainId, EncryptedPrivateTxRecord,
@@ -14,6 +16,9 @@ use miden_node_private_tx_golden::{
 use miden_protocol::Word;
 use miden_protocol::transaction::TransactionId;
 use miden_protocol::utils::serde::{Deserializable, Serializable};
+
+const SLASH_AMOUNT: u64 = 10;
+const BOND_AMOUNT: u64 = 25;
 
 #[test]
 fn golden_adapter_dkg_and_audit_flow_roundtrips() {
@@ -177,9 +182,10 @@ fn audit_coordination_drives_golden_audit_flow_to_completion() {
     let adapter = GoldenThresholdAdapter;
     let viewing_group = setup_viewing_group(&adapter);
     let (encrypted_record, expected_record) = archive_record(&adapter, &viewing_group);
-    let coordinator = InMemoryAuditCoordinator::new(100);
+    let coordinator = InMemoryAuditCoordinator::new(100, SLASH_AMOUNT);
     let auditor_id = AuditorId::new("auditor-1").unwrap();
     coordinator.authorize_auditor(auditor_id.clone()).unwrap();
+    deposit_bonds(&coordinator, &viewing_group.key_shares);
 
     let (transport_public_key, transport_secret) =
         GoldenThresholdAdapter::audit_transport_keypair();
@@ -243,6 +249,84 @@ fn audit_coordination_drives_golden_audit_flow_to_completion() {
     let settlement = coordinator.settle(request_id).unwrap();
     assert_eq!(settlement.responded_parties.len(), viewing_group.key_shares.len());
     assert!(settlement.slashed_parties.is_empty());
+    assert!(settlement.slash_amounts.is_empty());
+    for share in &viewing_group.key_shares {
+        assert_eq!(coordinator.party_bond(&share.party_id).unwrap(), BOND_AMOUNT);
+    }
+}
+
+#[test]
+fn audit_coordination_tolerates_single_non_responder_with_slashing() {
+    let adapter = GoldenThresholdAdapter;
+    let viewing_group = setup_viewing_group(&adapter);
+    let (encrypted_record, expected_record) = archive_record(&adapter, &viewing_group);
+    let coordinator = InMemoryAuditCoordinator::new(100, SLASH_AMOUNT);
+    let auditor_id = AuditorId::new("auditor-1").unwrap();
+    coordinator.authorize_auditor(auditor_id.clone()).unwrap();
+    deposit_bonds(&coordinator, &viewing_group.key_shares);
+
+    let (transport_public_key, transport_secret) =
+        GoldenThresholdAdapter::audit_transport_keypair();
+    let request = audit_request(
+        auditor_id,
+        &encrypted_record,
+        &viewing_group,
+        transport_public_key.clone(),
+        106,
+    );
+    let request_id = coordinator.request_audit(request).unwrap();
+    let archive_ad = archive_associated_data_for_record(ArchiveRecordAssociatedData {
+        record: &encrypted_record,
+    });
+
+    for key_share in viewing_group.key_shares.iter().take(usize::from(viewing_group.threshold)) {
+        let response = adapter
+            .produce_decryption_response(
+                key_share,
+                &encrypted_record.identity,
+                &archive_ad,
+                &transport_public_key,
+                &encrypted_record.data_key_protection,
+            )
+            .unwrap();
+        coordinator.submit_response(request_id, &key_share.party_id, response).unwrap();
+    }
+
+    let responses = coordinator.fetch_responses(request_id).unwrap();
+    let unlock = adapter
+        .combine_responses(
+            &encrypted_record.data_key_protection,
+            &responses.responses,
+            viewing_group.threshold,
+            &encrypted_record.identity,
+            &archive_ad,
+            &transport_secret,
+        )
+        .unwrap();
+    let record_key = ArchiveRecordKey::from_bytes(&unlock.record_key).unwrap();
+    let plaintext =
+        open_private_tx_record(&record_key, &encrypted_record.record_ciphertext, &archive_ad)
+            .unwrap();
+    assert_eq!(PrivateTxRecord::read_from_bytes(&plaintext).unwrap(), expected_record);
+
+    coordinator.advance_block(6).unwrap();
+    let settlement = coordinator.settle(request_id).unwrap();
+    let missing_party = viewing_group.key_shares[2].party_id.clone();
+    assert_eq!(
+        settlement.responded_parties,
+        viewing_group
+            .key_shares
+            .iter()
+            .take(2)
+            .map(|share| share.party_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(settlement.slashed_parties, vec![missing_party.clone()]);
+    assert_eq!(
+        settlement.slash_amounts,
+        BTreeMap::from([(missing_party.clone(), SLASH_AMOUNT)])
+    );
+    assert_eq!(coordinator.party_bond(&missing_party).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
 }
 
 #[test]
@@ -250,9 +334,10 @@ fn audit_coordination_settles_below_threshold_with_slashing() {
     let adapter = GoldenThresholdAdapter;
     let viewing_group = setup_viewing_group(&adapter);
     let (encrypted_record, _) = archive_record(&adapter, &viewing_group);
-    let coordinator = InMemoryAuditCoordinator::new(100);
+    let coordinator = InMemoryAuditCoordinator::new(100, SLASH_AMOUNT);
     let auditor_id = AuditorId::new("auditor-1").unwrap();
     coordinator.authorize_auditor(auditor_id.clone()).unwrap();
+    deposit_bonds(&coordinator, &viewing_group.key_shares);
 
     let (transport_public_key, transport_secret) =
         GoldenThresholdAdapter::audit_transport_keypair();
@@ -296,15 +381,22 @@ fn audit_coordination_settles_below_threshold_with_slashing() {
 
     coordinator.advance_block(6).unwrap();
     let settlement = coordinator.settle(request_id).unwrap();
+    let slashed = viewing_group
+        .key_shares
+        .iter()
+        .skip(1)
+        .map(|share| share.party_id.clone())
+        .collect::<Vec<_>>();
     assert_eq!(settlement.responded_parties, vec![key_share.party_id.clone()]);
+    assert_eq!(settlement.slashed_parties, slashed);
     assert_eq!(
-        settlement.slashed_parties,
+        settlement.slash_amounts,
         viewing_group
             .key_shares
             .iter()
             .skip(1)
-            .map(|share| share.party_id.clone())
-            .collect::<Vec<_>>()
+            .map(|share| (share.party_id.clone(), SLASH_AMOUNT))
+            .collect::<BTreeMap<_, _>>()
     );
 }
 
@@ -460,6 +552,12 @@ fn audit_request(
         transport_public_key,
         parties: viewing_group.key_shares.iter().map(|share| share.party_id.clone()).collect(),
         deadline_block,
+    }
+}
+
+fn deposit_bonds(coordinator: &InMemoryAuditCoordinator, key_shares: &[ViewingKeyShare]) {
+    for share in key_shares {
+        coordinator.deposit_bond(share.party_id.clone(), BOND_AMOUNT).unwrap();
     }
 }
 

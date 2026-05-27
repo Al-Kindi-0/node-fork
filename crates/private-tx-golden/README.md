@@ -32,8 +32,8 @@ The PoC proves the architecture end to end with real crypto:
 - The validator stores encrypted archive records in SQLite.
 - `GetPrivateTxArchiveRecord` returns a serialized `EncryptedPrivateTxRecord` by transaction ID.
 - `decrypt_private_tx_archive_record` runs the in-process audit ceremony and opens the archive.
-- `AuditCoordinator` models L1-style audit requests, response collection, and non-responder
-  settlement with an in-memory PoC backend.
+- `AuditCoordinator` models L1-style audit requests, response collection, party bonds, and
+  non-responder slashing with an in-memory PoC backend.
 - Adapter-owned wire bytes are domain-separated and versioned; golden-rs structs do not cross the
   crate boundary.
 
@@ -43,6 +43,8 @@ The PoC proves the architecture end to end with real crypto:
   SGX, SEV-SNP, Nitro, or TDX attestation backend and verifier.
 - Viewing-party governance is out of band. Production needs membership rules, approval policy, key
   custody rules, jurisdictional constraints, and an audit authorization mechanism.
+- Bonding and slashing are modeled with in-memory balances. Production needs token accounting and
+  on-chain enforcement.
 - Audit parties are modeled in-process. Production needs a request/response protocol for threshold
   parties.
 - No production binary launches the RPC server today; private-mode RPC behavior is verified at the
@@ -68,14 +70,16 @@ The PoC proves the architecture end to end with real crypto:
 The base `miden-node-private-tx` crate exposes `AuditCoordinator` as a small L1-like coordination
 surface. The PoC `InMemoryAuditCoordinator` lets an authorized auditor request an audit for one
 `tx_id`, publish an ephemeral audit transport key, collect threshold-party responses before a block
-deadline, and settle the request after the deadline.
+deadline, and settle the request after the deadline. The in-memory backend tracks viewing-party
+bonds and deducts a configured slash amount from non-responders. Parties without a prior mock bond
+deposit are still recorded as non-responders, with `0` deducted.
 
 The MVP assumptions are deliberately narrow:
 
 - Auditors are assumed honest and pay their own gas. Auditor bonding is deferred.
 - Auditor whitelist admission is a governance question outside the trait.
-- Settlement slashes non-submission only. Invalid-but-submitted responses require a v2 fraud-proof
-  path.
+- Settlement slashes non-submission only. A response with the right request context but invalid
+  crypto bytes counts as submitted in the PoC; fraud-proof slashing for invalid responses is v2.
 - L1 anchoring economically discourages off-chain collusion, but it does not cryptographically
   prevent a threshold quorum from colluding outside the protocol.
 

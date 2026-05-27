@@ -1,8 +1,8 @@
 //! Audit coordination primitives for L1-anchored private transaction unlocks.
 //!
-//! The coordinator models authorization, response collection, and non-responder settlement. It
-//! does not perform threshold cryptography or decide governance policy; auditors and viewing
-//! parties reconstruct and verify the cryptographic context from archive records.
+//! The coordinator models authorization, response collection, party bonds, and non-responder
+//! settlement. It does not perform threshold cryptography or decide governance policy; auditors and
+//! viewing parties reconstruct and verify the cryptographic context from archive records.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -74,12 +74,17 @@ pub struct AuditResponses {
 /// Settlement result for an audit request.
 ///
 /// The MVP settlement rule only distinguishes submitted from missing responses. It does not prove
-/// cryptographic response validity; invalid-response fraud proofs are a production extension.
+/// cryptographic response validity; invalid-response fraud proofs are a production extension. A
+/// non-responder without a prior bond deposit is still recorded as slashed with amount `0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditSettlement {
     pub request_id: AuditRequestId,
     pub responded_parties: Vec<ViewingPartyId>,
     pub slashed_parties: Vec<ViewingPartyId>,
+    /// Actual amount deducted from each non-responder.
+    ///
+    /// This can be lower than the configured slash amount when a party's bond is depleted.
+    pub slash_amounts: BTreeMap<ViewingPartyId, u64>,
     pub settled_at_block: u64,
 }
 
@@ -124,6 +129,8 @@ pub enum AuditCoordinationError {
     ResponseContextMismatch,
     #[error("audit request id space is exhausted")]
     RequestIdExhausted,
+    #[error("bond balance overflow")]
+    BondBalanceOverflow,
     #[error("audit coordinator state is unavailable")]
     CoordinatorUnavailable,
 }
@@ -132,7 +139,8 @@ pub enum AuditCoordinationError {
 ///
 /// A production implementation would back this trait with an L1 contract. The in-memory
 /// implementation below mirrors the MVP semantics: authorized auditors can request a per-tx audit,
-/// parties submit encrypted responses before a deadline, and settlement slashes non-responders.
+/// parties submit encrypted responses before a deadline, and settlement deducts bonds from
+/// non-responders.
 pub trait AuditCoordinator: Send + Sync {
     fn request_audit(
         &self,
@@ -171,8 +179,9 @@ pub trait AuditCoordinator: Send + Sync {
 
 /// In-memory audit coordinator for tests and PoC demos.
 ///
-/// This is not a production substitute for an L1 contract. It tracks authorized auditors, request
-/// deadlines, submitted responses, and non-responder slashing with an in-process block counter.
+/// This is not a production substitute for an L1 contract. It tracks authorized auditors, party
+/// bonds, request deadlines, submitted responses, and non-responder slashing with an in-process
+/// block counter.
 #[derive(Debug)]
 pub struct InMemoryAuditCoordinator {
     state: Mutex<CoordinatorState>,
@@ -182,7 +191,9 @@ pub struct InMemoryAuditCoordinator {
 struct CoordinatorState {
     current_block: u64,
     next_request_id: u64,
+    slash_amount: u64,
     authorized_auditors: BTreeSet<AuditorId>,
+    party_bonds: BTreeMap<ViewingPartyId, u64>,
     requests: BTreeMap<AuditRequestId, RequestState>,
 }
 
@@ -194,12 +205,19 @@ struct RequestState {
 }
 
 impl InMemoryAuditCoordinator {
-    pub fn new(initial_block: u64) -> Self {
+    /// Creates an in-memory coordinator at `initial_block`.
+    ///
+    /// `slash_amount` is deducted from each non-responder's bond during settlement, capped by the
+    /// party's available bond balance. Production L1 backends should require a bond deposit before
+    /// a party can join a viewing group.
+    pub fn new(initial_block: u64, slash_amount: u64) -> Self {
         Self {
             state: Mutex::new(CoordinatorState {
                 current_block: initial_block,
                 next_request_id: 1,
+                slash_amount,
                 authorized_auditors: BTreeSet::new(),
+                party_bonds: BTreeMap::new(),
                 requests: BTreeMap::new(),
             }),
         }
@@ -208,6 +226,24 @@ impl InMemoryAuditCoordinator {
     pub fn authorize_auditor(&self, auditor_id: AuditorId) -> Result<(), AuditCoordinationError> {
         self.lock_state()?.authorized_auditors.insert(auditor_id);
         Ok(())
+    }
+
+    /// Deposits mock bond balance for a viewing party and returns the new balance.
+    pub fn deposit_bond(
+        &self,
+        party_id: ViewingPartyId,
+        amount: u64,
+    ) -> Result<u64, AuditCoordinationError> {
+        let mut state = self.lock_state()?;
+        let balance = state.party_bonds.entry(party_id).or_default();
+        *balance =
+            balance.checked_add(amount).ok_or(AuditCoordinationError::BondBalanceOverflow)?;
+        Ok(*balance)
+    }
+
+    /// Returns a viewing party's current mock bond balance.
+    pub fn party_bond(&self, party_id: &ViewingPartyId) -> Result<u64, AuditCoordinationError> {
+        Ok(self.lock_state()?.party_bonds.get(party_id).copied().unwrap_or_default())
     }
 
     pub fn advance_block(&self, blocks: u64) -> Result<u64, AuditCoordinationError> {
@@ -361,23 +397,36 @@ impl AuditCoordinator for InMemoryAuditCoordinator {
     ) -> Result<AuditSettlement, AuditCoordinationError> {
         let mut state = self.lock_state()?;
         let current_block = state.current_block;
-        let request_state = state
-            .requests
-            .get_mut(&request_id)
-            .ok_or(AuditCoordinationError::RequestNotFound(request_id))?;
-        if let Some(settlement) = &request_state.settlement {
-            return Ok(settlement.clone());
-        }
-        if current_block < request_state.request.deadline_block {
-            return Err(AuditCoordinationError::DeadlineNotPassed);
-        }
+        let (parties, responded) = {
+            let request_state = state
+                .requests
+                .get(&request_id)
+                .ok_or(AuditCoordinationError::RequestNotFound(request_id))?;
+            if let Some(settlement) = &request_state.settlement {
+                return Ok(settlement.clone());
+            }
+            if current_block < request_state.request.deadline_block {
+                return Err(AuditCoordinationError::DeadlineNotPassed);
+            }
+
+            (
+                request_state.request.parties.clone(),
+                request_state.responses.keys().cloned().collect::<BTreeSet<_>>(),
+            )
+        };
 
         let mut responded_parties = Vec::new();
         let mut slashed_parties = Vec::new();
-        for party in &request_state.request.parties {
-            if request_state.responses.contains_key(party) {
+        let mut slash_amounts = BTreeMap::new();
+        let slash_amount = state.slash_amount;
+        for party in parties {
+            if responded.contains(&party) {
                 responded_parties.push(party.clone());
             } else {
+                let bond = state.party_bonds.entry(party.clone()).or_default();
+                let slashed = (*bond).min(slash_amount);
+                *bond -= slashed;
+                slash_amounts.insert(party.clone(), slashed);
                 slashed_parties.push(party.clone());
             }
         }
@@ -386,9 +435,14 @@ impl AuditCoordinator for InMemoryAuditCoordinator {
             request_id,
             responded_parties,
             slashed_parties,
+            slash_amounts,
             settled_at_block: current_block,
         };
-        request_state.settlement = Some(settlement.clone());
+        state
+            .requests
+            .get_mut(&request_id)
+            .expect("request checked before settlement")
+            .settlement = Some(settlement.clone());
 
         Ok(settlement)
     }
@@ -412,20 +466,26 @@ fn validate_request_parties(parties: &[ViewingPartyId]) -> Result<(), AuditCoord
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use miden_protocol::Word;
     use miden_protocol::transaction::TransactionId;
     use miden_protocol::utils::serde::{Deserializable, Serializable};
 
     use super::*;
 
+    const SLASH_AMOUNT: u64 = 10;
+    const BOND_AMOUNT: u64 = 25;
+
     #[test]
     fn in_memory_coordinator_tracks_request_lifecycle() {
-        let coordinator = InMemoryAuditCoordinator::new(10);
+        let coordinator = InMemoryAuditCoordinator::new(10, SLASH_AMOUNT);
         let auditor = auditor_id("auditor-1");
         let request = audit_request(auditor.clone(), 12);
         let party_1 = request.parties[0].clone();
         let party_2 = request.parties[1].clone();
         let party_3 = request.parties[2].clone();
+        deposit_bonds(&coordinator, &request.parties, BOND_AMOUNT);
 
         assert_eq!(
             coordinator.request_audit(request.clone()).unwrap_err(),
@@ -467,18 +527,210 @@ mod tests {
 
         let settlement = coordinator.settle(request_id).unwrap();
         assert_eq!(settlement.responded_parties, vec![party_1.clone()]);
-        assert_eq!(settlement.slashed_parties, vec![party_2, party_3]);
+        assert_eq!(settlement.slashed_parties, vec![party_2.clone(), party_3.clone()]);
+        assert_eq!(
+            settlement.slash_amounts,
+            BTreeMap::from([(party_2.clone(), SLASH_AMOUNT), (party_3.clone(), SLASH_AMOUNT)])
+        );
         assert_eq!(settlement.settled_at_block, 12);
+        assert_eq!(coordinator.party_bond(&party_1).unwrap(), BOND_AMOUNT);
+        assert_eq!(coordinator.party_bond(&party_2).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
+        assert_eq!(coordinator.party_bond(&party_3).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
         assert_eq!(
             coordinator.request_status(request_id).unwrap(),
             AuditRequestStatus::Settled(settlement.clone())
         );
         assert_eq!(coordinator.settle(request_id).unwrap(), settlement);
+        assert_eq!(coordinator.party_bond(&party_2).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
+        assert_eq!(coordinator.party_bond(&party_3).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
+        assert_eq!(
+            coordinator
+                .submit_response(request_id, &party_2, response_for(&request, party_2.clone()))
+                .unwrap_err(),
+            AuditCoordinationError::RequestAlreadySettled(request_id)
+        );
+    }
+
+    #[test]
+    fn in_memory_coordinator_keeps_bonds_intact_when_all_parties_respond() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let request = audit_request(auditor, 12);
+        deposit_bonds(&coordinator, &request.parties, BOND_AMOUNT);
+        let request_id = coordinator.request_audit(request.clone()).unwrap();
+
+        for party in &request.parties {
+            coordinator
+                .submit_response(request_id, party, response_for(&request, party.clone()))
+                .unwrap();
+        }
+
+        coordinator.advance_block(2).unwrap();
+        let settlement = coordinator.settle(request_id).unwrap();
+        assert_eq!(settlement.responded_parties, request.parties);
+        assert!(settlement.slashed_parties.is_empty());
+        assert!(settlement.slash_amounts.is_empty());
+        for party in &settlement.responded_parties {
+            assert_eq!(coordinator.party_bond(party).unwrap(), BOND_AMOUNT);
+        }
+    }
+
+    #[test]
+    fn in_memory_coordinator_slashes_single_non_responder() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let request = audit_request(auditor, 12);
+        let missing_party = request.parties[2].clone();
+        deposit_bonds(&coordinator, &request.parties, BOND_AMOUNT);
+        let request_id = coordinator.request_audit(request.clone()).unwrap();
+
+        for party in request.parties.iter().take(2) {
+            coordinator
+                .submit_response(request_id, party, response_for(&request, party.clone()))
+                .unwrap();
+        }
+
+        coordinator.advance_block(2).unwrap();
+        let settlement = coordinator.settle(request_id).unwrap();
+        assert_eq!(settlement.responded_parties, request.parties[..2]);
+        assert_eq!(settlement.slashed_parties, vec![missing_party.clone()]);
+        assert_eq!(
+            settlement.slash_amounts,
+            BTreeMap::from([(missing_party.clone(), SLASH_AMOUNT)])
+        );
+        assert_eq!(coordinator.party_bond(&missing_party).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
+    }
+
+    #[test]
+    fn in_memory_coordinator_repeated_slashing_depletes_bond() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let party = party_id("party-1");
+        coordinator.deposit_bond(party.clone(), 15).unwrap();
+
+        let first = settle_request_without_party(&coordinator, auditor.clone(), 12, &party);
+        assert_eq!(first.slash_amounts.get(&party), Some(&10));
+        assert_eq!(coordinator.party_bond(&party).unwrap(), 5);
+
+        let second = settle_request_without_party(&coordinator, auditor.clone(), 14, &party);
+        assert_eq!(second.slash_amounts.get(&party), Some(&5));
+        assert_eq!(coordinator.party_bond(&party).unwrap(), 0);
+
+        let third = settle_request_without_party(&coordinator, auditor, 16, &party);
+        assert_eq!(third.slash_amounts.get(&party), Some(&0));
+        assert_eq!(coordinator.party_bond(&party).unwrap(), 0);
+    }
+
+    #[test]
+    fn in_memory_coordinator_records_zero_slash_for_missing_bond() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let request = audit_request(auditor, 12);
+        let missing_party = request.parties[2].clone();
+        let request_id = coordinator.request_audit(request.clone()).unwrap();
+
+        for party in request.parties.iter().take(2) {
+            coordinator
+                .submit_response(request_id, party, response_for(&request, party.clone()))
+                .unwrap();
+        }
+
+        coordinator.advance_block(2).unwrap();
+        let settlement = coordinator.settle(request_id).unwrap();
+        assert_eq!(settlement.slashed_parties, vec![missing_party.clone()]);
+        assert_eq!(settlement.slash_amounts, BTreeMap::from([(missing_party.clone(), 0)]));
+        assert_eq!(coordinator.party_bond(&missing_party).unwrap(), 0);
+    }
+
+    #[test]
+    fn in_memory_coordinator_does_not_slash_before_deadline() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let request = audit_request(auditor, 12);
+        let missing_party = request.parties[2].clone();
+        deposit_bonds(&coordinator, &request.parties, BOND_AMOUNT);
+        let request_id = coordinator.request_audit(request.clone()).unwrap();
+
+        for party in request.parties.iter().take(2) {
+            coordinator
+                .submit_response(request_id, party, response_for(&request, party.clone()))
+                .unwrap();
+        }
+
+        assert_eq!(
+            coordinator.settle(request_id).unwrap_err(),
+            AuditCoordinationError::DeadlineNotPassed
+        );
+        assert_eq!(coordinator.party_bond(&missing_party).unwrap(), BOND_AMOUNT);
+    }
+
+    #[test]
+    fn in_memory_coordinator_treats_crypto_invalid_response_as_submitted() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let request = audit_request(auditor, 12);
+        let party = request.parties[2].clone();
+        deposit_bonds(&coordinator, &request.parties, BOND_AMOUNT);
+        let request_id = coordinator.request_audit(request.clone()).unwrap();
+
+        for responder in &request.parties {
+            let mut response = response_for(&request, responder.clone());
+            if responder == &party {
+                response.bytes = b"not-a-valid-threshold-response".to_vec();
+            }
+            coordinator.submit_response(request_id, responder, response).unwrap();
+        }
+
+        coordinator.advance_block(2).unwrap();
+        let settlement = coordinator.settle(request_id).unwrap();
+        assert!(settlement.slashed_parties.is_empty());
+        assert!(settlement.slash_amounts.is_empty());
+        assert_eq!(coordinator.party_bond(&party).unwrap(), BOND_AMOUNT);
+    }
+
+    #[test]
+    fn in_memory_coordinator_slashes_per_request() {
+        let coordinator = authorized_coordinator();
+        let auditor = auditor_id("auditor-1");
+        let party = party_id("party-1");
+        let first_request = audit_request(auditor.clone(), 12);
+        let second_request = audit_request(auditor, 12);
+        deposit_bonds(&coordinator, &first_request.parties, BOND_AMOUNT);
+
+        let first_id = coordinator.request_audit(first_request.clone()).unwrap();
+        let second_id = coordinator.request_audit(second_request.clone()).unwrap();
+
+        for request_id in [first_id, second_id] {
+            for responder in first_request.parties.iter().skip(1) {
+                coordinator
+                    .submit_response(
+                        request_id,
+                        responder,
+                        response_for(&first_request, responder.clone()),
+                    )
+                    .unwrap();
+            }
+        }
+        coordinator
+            .submit_response(first_id, &party, response_for(&first_request, party.clone()))
+            .unwrap();
+
+        coordinator.advance_block(2).unwrap();
+        let first_settlement = coordinator.settle(first_id).unwrap();
+        let second_settlement = coordinator.settle(second_id).unwrap();
+
+        assert!(first_settlement.slashed_parties.is_empty());
+        assert_eq!(second_settlement.slashed_parties, vec![party.clone()]);
+        assert_eq!(
+            second_settlement.slash_amounts,
+            BTreeMap::from([(party.clone(), SLASH_AMOUNT)])
+        );
+        assert_eq!(coordinator.party_bond(&party).unwrap(), BOND_AMOUNT - SLASH_AMOUNT);
     }
 
     #[test]
     fn in_memory_coordinator_rejects_duplicate_request_parties() {
-        let coordinator = InMemoryAuditCoordinator::new(10);
+        let coordinator = InMemoryAuditCoordinator::new(10, SLASH_AMOUNT);
         let auditor = auditor_id("auditor-1");
         coordinator.authorize_auditor(auditor.clone()).unwrap();
 
@@ -492,7 +744,7 @@ mod tests {
 
     #[test]
     fn in_memory_coordinator_rejects_unknown_party_response() {
-        let coordinator = InMemoryAuditCoordinator::new(10);
+        let coordinator = InMemoryAuditCoordinator::new(10, SLASH_AMOUNT);
         let auditor = auditor_id("auditor-1");
         coordinator.authorize_auditor(auditor.clone()).unwrap();
 
@@ -509,7 +761,7 @@ mod tests {
 
     #[test]
     fn in_memory_coordinator_rejects_response_context_mismatch() {
-        let coordinator = InMemoryAuditCoordinator::new(10);
+        let coordinator = InMemoryAuditCoordinator::new(10, SLASH_AMOUNT);
         let auditor = auditor_id("auditor-1");
         coordinator.authorize_auditor(auditor.clone()).unwrap();
 
@@ -522,6 +774,53 @@ mod tests {
             coordinator.submit_response(request_id, &party, bad_response).unwrap_err(),
             AuditCoordinationError::ResponseContextMismatch
         );
+    }
+
+    #[test]
+    fn in_memory_coordinator_rejects_bond_overflow() {
+        let coordinator = InMemoryAuditCoordinator::new(10, SLASH_AMOUNT);
+        let party = party_id("party-1");
+
+        coordinator.deposit_bond(party.clone(), u64::MAX).unwrap();
+        assert_eq!(
+            coordinator.deposit_bond(party, 1).unwrap_err(),
+            AuditCoordinationError::BondBalanceOverflow
+        );
+    }
+
+    fn authorized_coordinator() -> InMemoryAuditCoordinator {
+        let coordinator = InMemoryAuditCoordinator::new(10, SLASH_AMOUNT);
+        coordinator.authorize_auditor(auditor_id("auditor-1")).unwrap();
+        coordinator
+    }
+
+    fn deposit_bonds(
+        coordinator: &InMemoryAuditCoordinator,
+        parties: &[ViewingPartyId],
+        amount: u64,
+    ) {
+        for party in parties {
+            coordinator.deposit_bond(party.clone(), amount).unwrap();
+        }
+    }
+
+    fn settle_request_without_party(
+        coordinator: &InMemoryAuditCoordinator,
+        auditor: AuditorId,
+        deadline_block: u64,
+        missing_party: &ViewingPartyId,
+    ) -> AuditSettlement {
+        let request = audit_request(auditor, deadline_block);
+        let request_id = coordinator.request_audit(request.clone()).unwrap();
+        for responder in request.parties.iter().filter(|party| *party != missing_party) {
+            coordinator
+                .submit_response(request_id, responder, response_for(&request, responder.clone()))
+                .unwrap();
+        }
+        coordinator
+            .advance_block(deadline_block.saturating_sub(coordinator.current_block().unwrap()))
+            .unwrap();
+        coordinator.settle(request_id).unwrap()
     }
 
     fn audit_request(auditor_id: AuditorId, deadline_block: u64) -> AuditRequest {
