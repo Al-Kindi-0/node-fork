@@ -226,7 +226,7 @@ impl Narrator {
             return Ok(());
         }
 
-        println!("{}", self.paint("1;36", "Private validator Tier 2 demo"));
+        println!("{}", self.paint("1;36", "Private validator demo"));
         println!(
             "{}",
             self.paint(

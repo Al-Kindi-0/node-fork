@@ -27,3 +27,7 @@ miden-node-private-tx = { workspace = true }
 miden-protocol       = { workspace = true }
 rand08               = { workspace = true }
 thiserror            = { workspace = true }
+
+[dev-dependencies]
+crossterm = { workspace = true }
+ratatui   = { workspace = true }

@@ -69,8 +69,9 @@ The PoC proves the architecture end to end with real crypto:
 
 The base `miden-node-private-tx` crate exposes `AuditCoordinator` as a small L1-like coordination
 surface. The PoC `InMemoryAuditCoordinator` lets an authorized auditor request an audit for one
-`tx_id`, publish an ephemeral audit transport key, collect threshold-party responses before a block
-deadline, and settle the request after the deadline. The in-memory backend tracks viewing-party
+`tx_id`, publish a fresh reply public key, collect threshold-party responses before a block
+deadline, and settle the request after the deadline. The reply key is per audit, so old audit
+responses are not tied to a reused auditor decryption key. The in-memory backend tracks viewing-party
 bonds and deducts a configured slash amount from non-responders. Parties without a prior mock bond
 deposit are still recorded as non-responders, with `0` deducted.
 
@@ -90,7 +91,8 @@ The MVP assumptions are deliberately narrow:
 - `audit.rs` contains the reusable in-process audit helper.
 - `wire.rs` owns golden-backed serialization.
 - `compat.rs` contains the current golden-rs compatibility shim.
-- `examples/private_validator_demo.rs` runs the in-process PoC without starting node services.
+- `examples/private_validator_demo.rs` runs the scriptable in-process demo and prints metrics.
+- `examples/private_validator_tui.rs` runs the pane-based live walkthrough.
 
 ## Running the Demo
 
@@ -106,36 +108,50 @@ Run the validator archive-fetch/audit integration test:
 cargo test -p miden-validator get_private_tx_archive_record
 ```
 
-Run the in-process demo:
+Run the pane-based TUI for a live walkthrough:
+
+```bash
+cargo run -p miden-node-private-tx-golden --example private_validator_tui
+```
+
+The TUI uses `1`/`2`/`3` to switch audit scenarios, arrows or Space to move through the
+flow, `r` to reset, and `q` to quit. It can start directly in a scenario:
+
+```bash
+cargo run -p miden-node-private-tx-golden --example private_validator_tui -- --all
+cargo run -p miden-node-private-tx-golden --example private_validator_tui -- --one-missing
+cargo run -p miden-node-private-tx-golden --example private_validator_tui -- --below-threshold
+```
+
+Use a terminal at least 132x40. The TUI shows the same private fields as cleartext for the
+client/validator/auditor and as sealed values for the RPC operator. The sidebar tracks who holds
+secrets, what is public or opaque, measured timings, and mock party bonds. Scenario switching
+re-renders one real happy-path crypto run; it does not re-run the ceremony for each scenario.
+
+Run the scriptable demo for compact metrics:
 
 ```bash
 cargo run -p miden-node-private-tx-golden --example private_validator_demo
 ```
 
-Run the narrated Tier 2 demo:
+For slide data:
 
 ```bash
-cargo run -p miden-node-private-tx-golden --example private_validator_demo -- --narrated
+cargo run -p miden-node-private-tx-golden --example private_validator_demo -- --json
 ```
 
-Run the interactive Tier 2 demo:
+For a log-style walkthrough instead of the TUI:
 
 ```bash
-cargo run -p miden-node-private-tx-golden --example private_validator_demo -- --interactive
+cargo run -p miden-node-private-tx-golden --example private_validator_demo -- --narrated --pause
 ```
 
-For live presentation, add `--pause` to wait between stages. For slide data, use `--json`.
 Narrated and JSON modes also run the audit-coordination contrast: a happy audit leaves bonds intact,
-while a missed response triggers mock slashing.
-Interactive mode prompts for audit-party behavior: everyone responds, one representative party does
-not respond, or too few parties respond. For repeatable rehearsals, script it with
-`--scenario=all`, `--scenario=one-missing`, or `--scenario=below-threshold`.
+while a missed response triggers mock slashing. The prompt-based interactive mode is still available
+with `--interactive`; repeatable runs can use `--scenario=all`, `--scenario=one-missing`, or
+`--scenario=below-threshold`.
 
-Narrated output includes small terminal visuals for sealed payloads, actor views, threshold
-responses, and bond settlement. It uses ANSI color when stdout is a terminal. Use `--no-color` to
-disable color, or `--color=always` when recording through a wrapper that hides terminal detection.
-
-Sample output captured on 2026-05-27:
+Sample output:
 
 ```text
 private validator golden-rs demo
@@ -154,9 +170,6 @@ audit_decrypt_ms=110
 total_ms=2610
 ```
 
-The timings are machine-dependent; byte counts should stay stable unless the envelope or wire format
-changes.
-
 ## Metrics
 
 - `participants` / `threshold`: viewing group shape used by the demo.
@@ -164,7 +177,10 @@ changes.
 - `archive_record_bytes`: serialized encrypted archive record stored by the validator.
 - `archive_ciphertext_bytes`: AEAD ciphertext for the sealed `PrivateTxRecord`, including the
   private note payload and archive metadata, but not the outer archive envelope or wrapped key.
-- `wrapped_key_bytes`: threshold-wrapped per-transaction archive key.
+- `wrapped_key_bytes`: threshold-wrapped per-transaction archive key. This can be larger than the
+  sealed record in the demo because the demo note is tiny while the threshold wrapper
+  carries fixed cryptographic material. Real private inputs are expected to contain more note data,
+  so this ratio is not representative of production payload sizes.
 - `audit_responses_count`: threshold responses combined by the auditor. Equals threshold on a
   successful ceremony.
 - `audit_response_bytes_total` / `audit_response_bytes_avg`: serialized audit response overhead.
@@ -172,9 +188,9 @@ changes.
 - `client_encrypt_ms`: client-side payload encryption time.
 - `validator_archive_ms`: decrypt, archive encrypt, and threshold wrap time.
 - `audit_decrypt_ms`: audit response production, verification, combine, and archive open time.
-- `coordination`: JSON-only metrics for the Tier 2 audit-coordination contrast. The happy path
-  shows all parties responding with no slashing; the missed-response path shows one party's mock
-  bond decreasing from `100` to `90`.
+- `coordination`: JSON-only metrics for the audit-coordination contrast. The happy path shows all
+  parties responding with no slashing; the missed-response path shows one party's mock bond
+  decreasing from `100` to `90`.
 - `total_ms`: full in-process demo wall-clock time.
 
 ## Validation Coverage
@@ -194,12 +210,3 @@ batch proof inputs from `HashMap` iteration order, which is not stable after wir
 PoC-sized groups, `compat.rs` retries the same proof verification across recipient-order
 permutations. The retry path is capped at six recipients because it is factorial work; larger
 fallback cases fail closed.
-
-As of 2026-05-27, the upstream
-[`farazshaikh/golden-rs` issue tracker](https://github.com/farazshaikh/golden-rs/issues) showed
-zero open issues. An
-[exact search](https://github.com/farazshaikh/golden-rs/issues?q=is%3Aissue+%22batch+eVRF+verification+failed%22)
-for `"batch eVRF verification failed"` returned no results.
-
-File an upstream issue or vendor a small ordered-verification patch before treating this adapter as
-more than PoC code.
