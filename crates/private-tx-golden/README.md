@@ -57,6 +57,11 @@ The PoC proves the architecture end to end with real crypto:
   validator identity.
 - Submission-key descriptors use an open-ended `genesis..max` block validity window in the PoC.
   Production should publish real validity windows per rotation epoch.
+- The validator has an in-memory submission-key ring for current and draining keys. Production still
+  needs a rotation trigger, bounded validity windows so cached descriptors cannot outlive the drain
+  window, and durable key custody. `miden-crypto` key-exchange keys currently zeroize on drop; a
+  production build should keep that as an audited dependency invariant and cover any persisted key
+  copies.
 - DKG setup in tests and the demo uses local helper code for a 3-party, threshold-2 group. A
   long-lived test suite should extract a shared golden fixture.
 - `miden-node-private-tx-golden` is a runtime validator dependency because private mode constructs
@@ -64,8 +69,7 @@ The PoC proves the architecture end to end with real crypto:
   feature-gate this dependency.
 - Decide whether to audit golden-rs, fork it, or replace the threshold primitive. The PoC treats
   golden-rs as a candidate backend, not a committed production choice.
-- Key rotation, DKG refresh or resharing, and archive handling for old viewing groups are not
-  implemented.
+- DKG refresh or resharing, and archive handling for old viewing groups are not implemented.
 - Archived private-record size limits and retention policy are not implemented.
 - CPU-heavy threshold wrapping and audit work run in-process. Production should move this work onto
   blocking worker threads.

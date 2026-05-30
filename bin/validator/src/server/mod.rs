@@ -187,23 +187,45 @@ impl Default for PrivateTxSubmissionConfig {
 pub(crate) struct PrivateTxPayloadDecryptor {
     chain_id: ChainId,
     validator_id: ValidatorId,
-    encryption_key_id: Word,
-    unsealing_key: UnsealingKey,
+    key_ring: SubmissionKeyRing,
 }
 
 impl PrivateTxPayloadDecryptor {
-    fn new(
-        chain_id: ChainId,
-        validator_id: ValidatorId,
-        encryption_key_id: Word,
-        unsealing_key: UnsealingKey,
-    ) -> Self {
-        Self {
-            chain_id,
-            validator_id,
-            encryption_key_id,
+    fn new(chain_id: ChainId, validator_id: ValidatorId, unsealing_key: UnsealingKey) -> Self {
+        let key_ring = SubmissionKeyRing::single(
+            chain_id.clone(),
+            validator_id.clone(),
             unsealing_key,
-        }
+            BlockNumber::GENESIS,
+            BlockNumber::MAX,
+        );
+
+        Self { chain_id, validator_id, key_ring }
+    }
+
+    fn current_submission_key_descriptor(&self) -> &PrivateValidatorDescriptor {
+        self.key_ring.current_descriptor()
+    }
+
+    #[cfg(test)]
+    fn rotate_submission_key_for_test(
+        &mut self,
+        next_unsealing_key: UnsealingKey,
+        valid_from: BlockNumber,
+        valid_until: BlockNumber,
+        destroy_previous_at: BlockNumber,
+    ) -> Word {
+        self.key_ring.rotate_for_test(
+            next_unsealing_key,
+            valid_from,
+            valid_until,
+            destroy_previous_at,
+        )
+    }
+
+    #[cfg(test)]
+    fn retire_drained_keys_for_test(&mut self, current_block: BlockNumber) {
+        self.key_ring.retire_drained_keys_for_test(current_block);
     }
 }
 
@@ -212,9 +234,134 @@ impl fmt::Debug for PrivateTxPayloadDecryptor {
         f.debug_struct("PrivateTxPayloadDecryptor")
             .field("chain_id", &self.chain_id)
             .field("validator_id", &self.validator_id)
-            .field("encryption_key_id", &self.encryption_key_id)
-            .field("unsealing_key", &"<redacted>")
+            .field("key_ring", &self.key_ring)
             .finish()
+    }
+}
+
+struct SubmissionKeyRing {
+    current: SubmissionKeySlot,
+    draining: Vec<SubmissionKeySlot>,
+}
+
+impl SubmissionKeyRing {
+    fn single(
+        chain_id: ChainId,
+        validator_id: ValidatorId,
+        unsealing_key: UnsealingKey,
+        valid_from: BlockNumber,
+        valid_until: BlockNumber,
+    ) -> Self {
+        Self {
+            current: SubmissionKeySlot::new(
+                chain_id,
+                validator_id,
+                unsealing_key,
+                valid_from,
+                valid_until,
+                None,
+            ),
+            draining: Vec::new(),
+        }
+    }
+
+    fn current_descriptor(&self) -> &PrivateValidatorDescriptor {
+        &self.current.descriptor
+    }
+
+    fn unsealing_key(&self, encryption_key_id: Word) -> Option<&UnsealingKey> {
+        self.current
+            .matches(encryption_key_id)
+            .then_some(&self.current.unsealing_key)
+            .or_else(|| {
+                self.draining
+                    .iter()
+                    .find(|slot| slot.matches(encryption_key_id))
+                    .map(|slot| &slot.unsealing_key)
+            })
+    }
+
+    #[cfg(test)]
+    fn rotate_for_test(
+        &mut self,
+        next_unsealing_key: UnsealingKey,
+        valid_from: BlockNumber,
+        valid_until: BlockNumber,
+        destroy_previous_at: BlockNumber,
+    ) -> Word {
+        let chain_id = self.current.descriptor.chain_id.clone();
+        let validator_id = self.current.descriptor.validator_id.clone();
+        let next = SubmissionKeySlot::new(
+            chain_id,
+            validator_id,
+            next_unsealing_key,
+            valid_from,
+            valid_until,
+            None,
+        );
+        let mut previous = std::mem::replace(&mut self.current, next);
+        // `destroy_at` is the first block at which the key is no longer accepted.
+        // Descriptors use an inclusive `valid_until`, so a demoted key must advertise
+        // no later than the block immediately before destruction.
+        previous.descriptor.valid_until =
+            previous.descriptor.valid_until.min(destroy_previous_at.saturating_sub(1));
+        previous.destroy_at = Some(destroy_previous_at);
+        let current_key_id = self.current.descriptor.encryption_key_id;
+        self.draining.push(previous);
+
+        current_key_id
+    }
+
+    #[cfg(test)]
+    fn retire_drained_keys_for_test(&mut self, current_block: BlockNumber) {
+        self.draining
+            .retain(|slot| slot.destroy_at.is_none_or(|destroy_at| current_block < destroy_at));
+    }
+}
+
+impl fmt::Debug for SubmissionKeyRing {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubmissionKeyRing")
+            .field("current_key_id", &self.current.descriptor.encryption_key_id)
+            .field("draining_keys", &self.draining.len())
+            .field("unsealing_keys", &"<redacted>")
+            .finish()
+    }
+}
+
+struct SubmissionKeySlot {
+    descriptor: PrivateValidatorDescriptor,
+    unsealing_key: UnsealingKey,
+    destroy_at: Option<BlockNumber>,
+}
+
+impl SubmissionKeySlot {
+    fn new(
+        chain_id: ChainId,
+        validator_id: ValidatorId,
+        unsealing_key: UnsealingKey,
+        valid_from: BlockNumber,
+        valid_until: BlockNumber,
+        destroy_at: Option<BlockNumber>,
+    ) -> Self {
+        let sealing_key = sealing_key_for_unsealing_key(&unsealing_key);
+        let encryption_key_id = submission_key_id(&sealing_key);
+        let descriptor = PrivateValidatorDescriptor {
+            version: PRIVATE_TX_VERSION,
+            chain_id,
+            validator_id,
+            encryption_key_id,
+            encryption_public_key: sealing_key.to_bytes(),
+            attestation_evidence: AttestationEvidence::none(),
+            valid_from,
+            valid_until,
+        };
+
+        Self { descriptor, unsealing_key, destroy_at }
+    }
+
+    fn matches(&self, encryption_key_id: Word) -> bool {
+        self.descriptor.encryption_key_id == encryption_key_id
     }
 }
 
@@ -255,7 +402,6 @@ pub(crate) enum PrivateTxSubmissionMode {
     Private {
         decryptor: PrivateTxPayloadDecryptor,
         archive_writer: PrivateTxArchiveWriter,
-        submission_key_descriptor: PrivateValidatorDescriptor,
     },
 }
 
@@ -263,15 +409,10 @@ impl fmt::Debug for PrivateTxSubmissionMode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Public => f.write_str("Public"),
-            Self::Private {
-                decryptor,
-                archive_writer,
-                submission_key_descriptor,
-            } => f
+            Self::Private { decryptor, archive_writer } => f
                 .debug_struct("Private")
                 .field("decryptor", decryptor)
                 .field("archive_writer", archive_writer)
-                .field("submission_key_descriptor", submission_key_descriptor)
                 .finish(),
         }
     }
@@ -286,30 +427,13 @@ impl From<PrivateTxSubmissionConfig> for PrivateTxSubmissionMode {
                 validator_id,
                 unsealing_key,
                 archive,
-            } => {
-                let sealing_key = sealing_key_for_unsealing_key(&unsealing_key);
-                let encryption_key_id = submission_key_id(&sealing_key);
-                let submission_key_descriptor = PrivateValidatorDescriptor {
-                    version: PRIVATE_TX_VERSION,
-                    chain_id: chain_id.clone(),
-                    validator_id: validator_id.clone(),
-                    encryption_key_id,
-                    encryption_public_key: sealing_key.to_bytes(),
-                    attestation_evidence: AttestationEvidence::none(),
-                    valid_from: BlockNumber::GENESIS,
-                    valid_until: BlockNumber::MAX,
-                };
-
-                Self::Private {
-                    decryptor: PrivateTxPayloadDecryptor::new(
-                        chain_id.clone(),
-                        validator_id.clone(),
-                        encryption_key_id,
-                        unsealing_key,
-                    ),
-                    archive_writer: PrivateTxArchiveWriter::new(chain_id, validator_id, archive),
-                    submission_key_descriptor,
-                }
+            } => Self::Private {
+                decryptor: PrivateTxPayloadDecryptor::new(
+                    chain_id.clone(),
+                    validator_id.clone(),
+                    unsealing_key,
+                ),
+                archive_writer: PrivateTxArchiveWriter::new(chain_id, validator_id, archive),
             },
         }
     }

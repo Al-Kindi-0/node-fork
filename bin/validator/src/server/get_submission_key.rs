@@ -28,8 +28,8 @@ impl grpc::server::validator_api::GetSubmissionKey for ValidatorServer {
                     "Private transaction submission is not enabled",
                 ));
             },
-            PrivateTxSubmissionMode::Private { submission_key_descriptor, .. } => {
-                submission_key_descriptor.clone()
+            PrivateTxSubmissionMode::Private { decryptor, .. } => {
+                decryptor.current_submission_key_descriptor().clone()
             },
         };
 
@@ -71,7 +71,9 @@ mod tests {
     use miden_protocol::utils::serde::{Deserializable, Serializable};
 
     use crate::server::tests::TestValidator;
-    use crate::server::{PrivateTxArchiveConfig, PrivateTxSubmissionConfig};
+    use crate::server::{
+        PrivateTxArchiveConfig, PrivateTxSubmissionConfig, PrivateTxSubmissionMode,
+    };
 
     #[tokio::test]
     async fn get_submission_key_rejects_public_mode() {
@@ -153,6 +155,58 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, SubmissionKeyVerificationError::ChainIdMismatch);
+    }
+
+    #[tokio::test]
+    async fn get_submission_key_returns_current_key_after_rotation() {
+        let chain_id = ChainId::new("miden-devnet").unwrap();
+        let validator_id = ValidatorId::new("validator-1").unwrap();
+        let initial_unsealing_key = UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new());
+        let initial_key_id = submission_key_id(&sealing_key_for(&initial_unsealing_key));
+        let next_secret_key = X25519SecretKey::new();
+        let next_sealing_key = SealingKey::X25519XChaCha20Poly1305(next_secret_key.public_key());
+        let next_key_id = submission_key_id(&next_sealing_key);
+        let mut validator = TestValidator::with_private_submission(private_config(
+            chain_id.clone(),
+            validator_id.clone(),
+            initial_unsealing_key,
+        ))
+        .await;
+
+        match &mut validator.server.private_tx_submission {
+            PrivateTxSubmissionMode::Private { decryptor, .. } => {
+                let rotated_key_id = decryptor.rotate_submission_key_for_test(
+                    UnsealingKey::X25519XChaCha20Poly1305(next_secret_key),
+                    BlockNumber::from(10),
+                    BlockNumber::MAX,
+                    BlockNumber::from(20),
+                );
+                assert_eq!(rotated_key_id, next_key_id);
+            },
+            PrivateTxSubmissionMode::Public => panic!("private mode expected"),
+        }
+
+        let response =
+            api_server::Api::get_submission_key(&validator.server, tonic::Request::new(()))
+                .await
+                .unwrap()
+                .into_inner();
+        let signed_key = SignedSubmissionKey::read_from_bytes(&response.signed_key).unwrap();
+        let descriptor = verify_signed_submission_key(
+            &signed_key,
+            &chain_id,
+            &validator_id,
+            BlockNumber::from(10),
+            &validator.server.signer.public_key(),
+        )
+        .unwrap();
+
+        assert_ne!(descriptor.encryption_key_id, initial_key_id);
+        assert_eq!(descriptor.encryption_key_id, next_key_id);
+        assert_eq!(
+            SealingKey::read_from_bytes(&descriptor.encryption_public_key).unwrap(),
+            next_sealing_key
+        );
     }
 
     #[test]

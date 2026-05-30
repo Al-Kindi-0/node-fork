@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 
+use miden_node_private_tx::types::{ChainId, ValidatorId};
 use miden_node_proto::generated::validator::api_server;
 use miden_node_proto::generated::{self as proto};
 use miden_node_store::GenesisState;
 use miden_node_utils::fee::test_fee_params;
-use miden_protocol::block::{BlockHeader, BlockInputs, ProposedBlock};
+use miden_protocol::block::{BlockHeader, BlockInputs, BlockNumber, ProposedBlock};
+use miden_protocol::crypto::dsa::eddsa_25519_sha512::SecretKey as X25519SecretKey;
+use miden_protocol::crypto::ies::UnsealingKey;
 use miden_protocol::testing::random_secret_key::random_secret_key;
 use miden_protocol::transaction::PartialBlockchain;
 use miden_tx::utils::serde::Serializable;
 
-use super::{PrivateTxSubmissionConfig, ValidatorServer};
+use super::{PrivateTxSubmissionConfig, SubmissionKeyRing, ValidatorServer};
 use crate::ValidatorSigner;
 use crate::db::{load, load_chain_tip, upsert_block_header};
 
@@ -132,6 +135,28 @@ async fn chain_tip_plus_one_succeeds() {
     let result = tv.call_sign_block(&proposed).await;
 
     assert!(result.is_ok(), "chain tip + 1 should succeed, got: {:?}", result.err());
+}
+
+#[test]
+fn rotation_clamps_draining_descriptor_validity_to_destroy_block() {
+    let mut ring = SubmissionKeyRing::single(
+        ChainId::new("miden-devnet").unwrap(),
+        ValidatorId::new("validator-1").unwrap(),
+        UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
+        BlockNumber::GENESIS,
+        BlockNumber::MAX,
+    );
+
+    ring.rotate_for_test(
+        UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
+        BlockNumber::from(10),
+        BlockNumber::MAX,
+        BlockNumber::from(30),
+    );
+
+    let draining = ring.draining.first().expect("previous key should be draining");
+    assert_eq!(draining.destroy_at, Some(BlockNumber::from(30)));
+    assert_eq!(draining.descriptor.valid_until, BlockNumber::from(29));
 }
 
 /// A replacement block at the same height as the current chain tip should be accepted.
