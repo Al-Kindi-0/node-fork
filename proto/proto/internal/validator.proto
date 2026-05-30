@@ -21,6 +21,9 @@ service Api {
    // Returns the signed private-transaction submission key descriptor.
    rpc GetSubmissionKey(google.protobuf.Empty) returns (PrivateTxSubmissionKey) {}
 
+   // Rotates the private-transaction submission key and returns the new signed descriptor.
+   rpc RotateSubmissionKey(RotateSubmissionKeyRequest) returns (PrivateTxSubmissionKey) {}
+
    // Fetches an encrypted private transaction archive record by transaction ID.
    //
    // The returned record is encrypted; access control is enforced by the threshold audit ceremony,
@@ -38,6 +41,18 @@ service Api {
 message PrivateTxSubmissionKey {
     // Encoded using [miden_node_private_tx::SignedSubmissionKey::to_bytes].
     bytes signed_key = 1;
+}
+
+// Manual private transaction submission-key rotation request.
+message RotateSubmissionKeyRequest {
+    // First block for which the new key descriptor is valid.
+    fixed32 valid_from = 1;
+
+    // Last block for which the new key descriptor is valid.
+    fixed32 valid_until = 2;
+
+    // First block at which the previous key is no longer accepted.
+    fixed32 destroy_previous_at = 3;
 }
 
 // Request for a private transaction archive record.

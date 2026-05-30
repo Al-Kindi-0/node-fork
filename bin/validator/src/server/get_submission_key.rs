@@ -1,6 +1,4 @@
-use miden_node_private_tx::{
-    SignedSubmissionKey, submission_key_commitment, verify_signed_submission_key,
-};
+use miden_node_private_tx::{SignedSubmissionKey, verify_signed_submission_key};
 use miden_node_proto::generated as grpc;
 use miden_protocol::utils::serde::Serializable;
 
@@ -29,15 +27,11 @@ impl grpc::server::validator_api::GetSubmissionKey for ValidatorServer {
                 ));
             },
             PrivateTxSubmissionMode::Private { decryptor, .. } => {
-                decryptor.current_submission_key_descriptor().clone()
+                decryptor.current_submission_key_descriptor()?
             },
         };
 
-        let commitment = submission_key_commitment(&descriptor);
-        let signature = self.signer.sign_commitment(commitment).await.map_err(|err| {
-            tonic::Status::internal(format!("Failed to sign submission key: {err}"))
-        })?;
-        let signed_key = SignedSubmissionKey::new(descriptor, signature);
+        let signed_key = self.sign_submission_key_descriptor(descriptor).await?;
 
         debug_assert!(
             verify_signed_submission_key(
@@ -166,22 +160,24 @@ mod tests {
         let next_secret_key = X25519SecretKey::new();
         let next_sealing_key = SealingKey::X25519XChaCha20Poly1305(next_secret_key.public_key());
         let next_key_id = submission_key_id(&next_sealing_key);
-        let mut validator = TestValidator::with_private_submission(private_config(
+        let validator = TestValidator::with_private_submission(private_config(
             chain_id.clone(),
             validator_id.clone(),
             initial_unsealing_key,
         ))
         .await;
 
-        match &mut validator.server.private_tx_submission {
+        match &validator.server.private_tx_submission {
             PrivateTxSubmissionMode::Private { decryptor, .. } => {
-                let rotated_key_id = decryptor.rotate_submission_key_for_test(
-                    UnsealingKey::X25519XChaCha20Poly1305(next_secret_key),
-                    BlockNumber::from(10),
-                    BlockNumber::MAX,
-                    BlockNumber::from(20),
-                );
-                assert_eq!(rotated_key_id, next_key_id);
+                let descriptor = decryptor
+                    .rotate_submission_key_for_test(
+                        UnsealingKey::X25519XChaCha20Poly1305(next_secret_key),
+                        BlockNumber::from(10),
+                        BlockNumber::MAX,
+                        BlockNumber::from(20),
+                    )
+                    .unwrap();
+                assert_eq!(descriptor.encryption_key_id, next_key_id);
             },
             PrivateTxSubmissionMode::Public => panic!("private mode expected"),
         }

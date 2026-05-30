@@ -10,6 +10,7 @@ use miden_node_private_tx::{
 use miden_node_proto::generated as grpc;
 use miden_node_utils::ErrorReport;
 use miden_node_utils::tracing::OpenTelemetrySpanExt;
+use miden_protocol::block::BlockNumber;
 use miden_protocol::transaction::{ProvenTransaction, TransactionId, TransactionInputs};
 use miden_protocol::utils::serde::{Deserializable, Serializable};
 use miden_protocol::{Hasher, Word};
@@ -40,10 +41,13 @@ impl grpc::server::validator_api::SubmitProvenTransaction for ValidatorServer {
         // The public tx hash binds the archive record to the submitted proof bytes, while tx_id is
         // the canonical transaction identifier.
         let public_tx_hash = Hasher::hash(&input.transaction);
+        let current_block = BlockNumber::from(self.chain_tip.load(Ordering::Relaxed));
 
-        let decoded_inputs = input
-            .private_inputs
-            .into_transaction_inputs(&self.private_tx_submission, tx_id)?;
+        let decoded_inputs = input.private_inputs.into_transaction_inputs(
+            &self.private_tx_submission,
+            tx_id,
+            current_block,
+        )?;
 
         // Validate the transaction.
         let tx_info =
@@ -118,6 +122,7 @@ impl SubmittedTransactionInputs {
         self,
         mode: &PrivateTxSubmissionMode,
         tx_id: TransactionId,
+        current_block: BlockNumber,
     ) -> tonic::Result<DecodedTransactionInputs> {
         match self {
             // Private-mode validators still accept cleartext submissions during the PoC migration
@@ -130,7 +135,7 @@ impl SubmittedTransactionInputs {
                 // Defense in depth for callers that skip the handle-level policy check.
                 PrivateTxSubmissionMode::Public => Err(encrypted_private_payload_unsupported()),
                 PrivateTxSubmissionMode::Private { decryptor, .. } => {
-                    decryptor.decrypt(tx_id, &payload)
+                    decryptor.decrypt(tx_id, &payload, current_block)
                 },
             },
         }
@@ -152,17 +157,19 @@ impl PrivateTxPayloadDecryptor {
         &self,
         tx_id: TransactionId,
         encrypted_payload: &[u8],
+        current_block: BlockNumber,
     ) -> tonic::Result<DecodedTransactionInputs> {
         let payload = EncryptedPrivateTxPayload::read_from_bytes(encrypted_payload)
             .map_err(|_| Status::invalid_argument("Invalid encrypted private payload"))?;
-        let unsealing_key = self
-            .key_ring
-            .unsealing_key(payload.validator_encryption_key_id)
+        let key_ring = self.key_ring()?;
+        let unsealing_key = key_ring
+            .unsealing_key(payload.validator_encryption_key_id, current_block)
             .ok_or_else(|| {
                 tracing::debug!(
                     target: crate::COMPONENT,
-                    current_key_id = %self.key_ring.current_descriptor().encryption_key_id,
+                    current_key_id = %key_ring.current_descriptor().encryption_key_id,
                     received_key_id = %payload.validator_encryption_key_id,
+                    %current_block,
                     "rejected encrypted private payload for inactive submission key"
                 );
                 Status::invalid_argument("Invalid encrypted private payload")
@@ -382,6 +389,7 @@ mod tests {
                 UnsealingKey::X25519XChaCha20Poly1305(SecretKey::new()),
             ),
             tx_id(7),
+            BlockNumber::GENESIS,
         ) {
             Ok(_) => panic!("malformed encrypted payload should be rejected"),
             Err(err) => err,
@@ -423,7 +431,7 @@ mod tests {
             archive: private_tx_archive_config(&mock_viewing_group()),
         });
 
-        let actual = input.into_transaction_inputs(&mode, tx_id).unwrap();
+        let actual = input.into_transaction_inputs(&mode, tx_id, BlockNumber::GENESIS).unwrap();
 
         assert_eq!(actual.transaction_inputs, expected);
         let archive_source = actual.archive_source.expect("encrypted inputs should be archived");
@@ -440,16 +448,16 @@ mod tests {
         let old_sealing_key = SealingKey::X25519XChaCha20Poly1305(old_secret_key.public_key());
         let old_key_id = submission_key_id(&old_sealing_key);
         let old_unsealing_key = UnsealingKey::X25519XChaCha20Poly1305(old_secret_key);
-        let mut mode =
+        let mode =
             private_tx_submission_mode(chain_id.clone(), validator_id.clone(), old_unsealing_key);
-        let new_key_id = rotate_submission_key_for_test(
-            &mut mode,
+        let descriptor = rotate_submission_key_for_test(
+            &mode,
             UnsealingKey::X25519XChaCha20Poly1305(SecretKey::new()),
             BlockNumber::from(20),
             BlockNumber::MAX,
             BlockNumber::from(30),
         );
-        assert_ne!(new_key_id, old_key_id);
+        assert_ne!(descriptor.encryption_key_id, old_key_id);
         let expected = transaction_inputs();
         let input = encrypted_inputs(
             &chain_id,
@@ -460,7 +468,7 @@ mod tests {
             &expected,
         );
 
-        let actual = input.into_transaction_inputs(&mode, tx_id).unwrap();
+        let actual = input.into_transaction_inputs(&mode, tx_id, BlockNumber::from(25)).unwrap();
 
         assert_eq!(actual.transaction_inputs, expected);
         assert_eq!(actual.archive_source.unwrap().validator_encryption_key_id, old_key_id);
@@ -475,16 +483,15 @@ mod tests {
         let old_sealing_key = SealingKey::X25519XChaCha20Poly1305(old_secret_key.public_key());
         let old_key_id = submission_key_id(&old_sealing_key);
         let old_unsealing_key = UnsealingKey::X25519XChaCha20Poly1305(old_secret_key);
-        let mut mode =
+        let mode =
             private_tx_submission_mode(chain_id.clone(), validator_id.clone(), old_unsealing_key);
         rotate_submission_key_for_test(
-            &mut mode,
+            &mode,
             UnsealingKey::X25519XChaCha20Poly1305(SecretKey::new()),
             BlockNumber::from(20),
             BlockNumber::MAX,
             BlockNumber::from(30),
         );
-        retire_drained_keys_for_test(&mut mode, BlockNumber::from(30));
         let input = encrypted_inputs(
             &chain_id,
             &validator_id,
@@ -494,13 +501,74 @@ mod tests {
             &transaction_inputs(),
         );
 
-        let err = match input.into_transaction_inputs(&mode, tx_id) {
+        let err = match input.into_transaction_inputs(&mode, tx_id, BlockNumber::from(30)) {
             Ok(_) => panic!("payload for a destroyed submission key should be rejected"),
             Err(err) => err,
         };
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("Invalid encrypted private payload"));
+    }
+
+    #[test]
+    fn private_mode_enforces_current_submission_key_validity_window() {
+        let chain_id = ChainId::new("miden-devnet").unwrap();
+        let validator_id = ValidatorId::new("validator-1").unwrap();
+        let tx_id = tx_id(13);
+        let mode = private_tx_submission_mode(
+            chain_id.clone(),
+            validator_id.clone(),
+            UnsealingKey::X25519XChaCha20Poly1305(SecretKey::new()),
+        );
+        let next_secret_key = SecretKey::new();
+        let next_sealing_key = SealingKey::X25519XChaCha20Poly1305(next_secret_key.public_key());
+        let next_key_id = submission_key_id(&next_sealing_key);
+        let descriptor = rotate_submission_key_for_test(
+            &mode,
+            UnsealingKey::X25519XChaCha20Poly1305(next_secret_key),
+            BlockNumber::from(20),
+            BlockNumber::from(25),
+            BlockNumber::from(30),
+        );
+        assert_eq!(descriptor.encryption_key_id, next_key_id);
+
+        let before_valid = encrypted_inputs(
+            &chain_id,
+            &validator_id,
+            tx_id,
+            &next_sealing_key,
+            next_key_id,
+            &transaction_inputs(),
+        );
+        let err = match before_valid.into_transaction_inputs(&mode, tx_id, BlockNumber::from(19)) {
+            Ok(_) => panic!("submission key should not be accepted before valid_from"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let active = encrypted_inputs(
+            &chain_id,
+            &validator_id,
+            tx_id,
+            &next_sealing_key,
+            next_key_id,
+            &transaction_inputs(),
+        );
+        active.into_transaction_inputs(&mode, tx_id, BlockNumber::from(20)).unwrap();
+
+        let expired = encrypted_inputs(
+            &chain_id,
+            &validator_id,
+            tx_id,
+            &next_sealing_key,
+            next_key_id,
+            &transaction_inputs(),
+        );
+        let err = match expired.into_transaction_inputs(&mode, tx_id, BlockNumber::from(26)) {
+            Ok(_) => panic!("submission key should not be accepted after valid_until"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
@@ -534,7 +602,7 @@ mod tests {
             archive: private_tx_archive_config(&mock_viewing_group()),
         });
 
-        let err = match input.into_transaction_inputs(&mode, tx_id) {
+        let err = match input.into_transaction_inputs(&mode, tx_id, BlockNumber::GENESIS) {
             Ok(_) => panic!("payload for a different submission key should be rejected"),
             Err(err) => err,
         };
@@ -682,12 +750,12 @@ mod tests {
     }
 
     fn rotate_submission_key_for_test(
-        mode: &mut PrivateTxSubmissionMode,
+        mode: &PrivateTxSubmissionMode,
         next_unsealing_key: UnsealingKey,
         valid_from: BlockNumber,
         valid_until: BlockNumber,
         destroy_previous_at: BlockNumber,
-    ) -> Word {
+    ) -> miden_node_private_tx::PrivateValidatorDescriptor {
         match mode {
             PrivateTxSubmissionMode::Private { decryptor, .. } => decryptor
                 .rotate_submission_key_for_test(
@@ -695,19 +763,8 @@ mod tests {
                     valid_from,
                     valid_until,
                     destroy_previous_at,
-                ),
-            PrivateTxSubmissionMode::Public => panic!("private mode expected"),
-        }
-    }
-
-    fn retire_drained_keys_for_test(
-        mode: &mut PrivateTxSubmissionMode,
-        current_block: BlockNumber,
-    ) {
-        match mode {
-            PrivateTxSubmissionMode::Private { decryptor, .. } => {
-                decryptor.retire_drained_keys_for_test(current_block);
-            },
+                )
+                .unwrap(),
             PrivateTxSubmissionMode::Public => panic!("private mode expected"),
         }
     }

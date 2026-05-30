@@ -31,6 +31,8 @@ The PoC proves the architecture end to end with real crypto:
 - Validator private mode loads an unsealing key and viewing group public key from config.
 - The validator exposes a signed submission-key descriptor containing the encryption key, key ID,
   validator ID, chain ID, and block-height validity window.
+- `RotateSubmissionKey` manually rotates the validator submission key and keeps the previous key
+  draining until its configured destroy block.
 - The validator stores encrypted archive records in SQLite.
 - `GetPrivateTxArchiveRecord` returns a serialized `EncryptedPrivateTxRecord` by transaction ID.
 - `decrypt_private_tx_archive_record` runs the in-process audit ceremony and opens the archive.
@@ -57,11 +59,11 @@ The PoC proves the architecture end to end with real crypto:
   validator identity.
 - Submission-key descriptors use an open-ended `genesis..max` block validity window in the PoC.
   Production should publish real validity windows per rotation epoch.
-- The validator has an in-memory submission-key ring for current and draining keys. Production still
-  needs a rotation trigger, bounded validity windows so cached descriptors cannot outlive the drain
-  window, and durable key custody. `miden-crypto` key-exchange keys currently zeroize on drop; a
-  production build should keep that as an audited dependency invariant and cover any persisted key
-  copies.
+- The validator has an in-memory submission-key ring and a manual internal rotation RPC. Production
+  still needs authenticated administration, a durable key-custody story, cleanup of expired draining
+  keys outside the rotation path, and bounded validity windows so cached descriptors cannot outlive
+  the drain window. `miden-crypto` key-exchange keys currently zeroize on drop; a production build
+  should keep that as an audited dependency invariant and cover any persisted key copies.
 - DKG setup in tests and the demo uses local helper code for a 3-party, threshold-2 group. A
   long-lived test suite should extract a shared golden fixture.
 - `miden-node-private-tx-golden` is a runtime validator dependency because private mode constructs

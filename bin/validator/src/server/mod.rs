@@ -2,14 +2,15 @@ use std::fmt::{self, Formatter};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use miden_node_db::Db;
 use miden_node_private_tx::{
     AttestationEvidence, ChainId, PRIVATE_TX_VERSION, PrivateValidatorDescriptor,
-    ThresholdRecordEncryptor, ValidatorId, ViewingGroupPublicKey, submission_key_id,
+    SignedSubmissionKey, ThresholdRecordEncryptor, ValidatorId, ViewingGroupPublicKey,
+    submission_key_commitment, submission_key_id,
 };
 use miden_node_proto::generated::validator::api_server;
 use miden_node_proto_build::validator_api_descriptor;
@@ -18,11 +19,13 @@ use miden_node_utils::panic::catch_panic_layer_fn;
 use miden_node_utils::tracing::grpc::grpc_trace_fn;
 use miden_protocol::Word;
 use miden_protocol::block::BlockNumber;
+use miden_protocol::crypto::dsa::eddsa_25519_sha512::SecretKey as X25519SecretKey;
 use miden_protocol::crypto::ies::{SealingKey, UnsealingKey};
 use miden_protocol::utils::serde::Serializable;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Status;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
@@ -36,6 +39,7 @@ mod tests;
 
 mod get_private_tx_archive_record;
 mod get_submission_key;
+mod rotate_submission_key;
 mod sign_block;
 mod status;
 mod submit_proven_transaction;
@@ -187,7 +191,7 @@ impl Default for PrivateTxSubmissionConfig {
 pub(crate) struct PrivateTxPayloadDecryptor {
     chain_id: ChainId,
     validator_id: ValidatorId,
-    key_ring: SubmissionKeyRing,
+    key_ring: RwLock<SubmissionKeyRing>,
 }
 
 impl PrivateTxPayloadDecryptor {
@@ -200,22 +204,55 @@ impl PrivateTxPayloadDecryptor {
             BlockNumber::MAX,
         );
 
-        Self { chain_id, validator_id, key_ring }
+        Self {
+            chain_id,
+            validator_id,
+            key_ring: RwLock::new(key_ring),
+        }
     }
 
-    fn current_submission_key_descriptor(&self) -> &PrivateValidatorDescriptor {
-        self.key_ring.current_descriptor()
+    fn current_submission_key_descriptor(&self) -> tonic::Result<PrivateValidatorDescriptor> {
+        Ok(self.key_ring()?.current_descriptor().clone())
+    }
+
+    fn prepare_submission_key_rotation(
+        &self,
+        valid_from: BlockNumber,
+        valid_until: BlockNumber,
+        destroy_previous_at: BlockNumber,
+    ) -> tonic::Result<PendingSubmissionKeyRotation> {
+        validate_rotation_window(valid_from, valid_until, destroy_previous_at)?;
+        let next_unsealing_key = UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new());
+        let next = SubmissionKeySlot::new(
+            self.chain_id.clone(),
+            self.validator_id.clone(),
+            next_unsealing_key,
+            valid_from,
+            valid_until,
+            None,
+        );
+
+        Ok(PendingSubmissionKeyRotation { next, destroy_previous_at })
+    }
+
+    fn install_submission_key_rotation(
+        &self,
+        pending: PendingSubmissionKeyRotation,
+        current_block: BlockNumber,
+    ) -> tonic::Result<PrivateValidatorDescriptor> {
+        self.key_ring_mut()?
+            .rotate(pending.next, pending.destroy_previous_at, current_block)
     }
 
     #[cfg(test)]
     fn rotate_submission_key_for_test(
-        &mut self,
+        &self,
         next_unsealing_key: UnsealingKey,
         valid_from: BlockNumber,
         valid_until: BlockNumber,
         destroy_previous_at: BlockNumber,
-    ) -> Word {
-        self.key_ring.rotate_for_test(
+    ) -> tonic::Result<PrivateValidatorDescriptor> {
+        self.rotate_submission_key_with(
             next_unsealing_key,
             valid_from,
             valid_until,
@@ -223,18 +260,51 @@ impl PrivateTxPayloadDecryptor {
         )
     }
 
-    #[cfg(test)]
-    fn retire_drained_keys_for_test(&mut self, current_block: BlockNumber) {
-        self.key_ring.retire_drained_keys_for_test(current_block);
+    fn rotate_submission_key_with(
+        &self,
+        next_unsealing_key: UnsealingKey,
+        valid_from: BlockNumber,
+        valid_until: BlockNumber,
+        destroy_previous_at: BlockNumber,
+    ) -> tonic::Result<PrivateValidatorDescriptor> {
+        validate_rotation_window(valid_from, valid_until, destroy_previous_at)?;
+        let next = SubmissionKeySlot::new(
+            self.chain_id.clone(),
+            self.validator_id.clone(),
+            next_unsealing_key,
+            valid_from,
+            valid_until,
+            None,
+        );
+
+        self.key_ring_mut()?.rotate(next, destroy_previous_at, BlockNumber::GENESIS)
+    }
+
+    fn key_ring(&self) -> tonic::Result<std::sync::RwLockReadGuard<'_, SubmissionKeyRing>> {
+        self.key_ring
+            .read()
+            .map_err(|_| Status::internal("private transaction submission key ring is unavailable"))
+    }
+
+    fn key_ring_mut(&self) -> tonic::Result<std::sync::RwLockWriteGuard<'_, SubmissionKeyRing>> {
+        self.key_ring
+            .write()
+            .map_err(|_| Status::internal("private transaction submission key ring is unavailable"))
     }
 }
 
 impl fmt::Debug for PrivateTxPayloadDecryptor {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let key_ring = self
+            .key_ring
+            .read()
+            .map(|ring| format!("{ring:?}"))
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+
         f.debug_struct("PrivateTxPayloadDecryptor")
             .field("chain_id", &self.chain_id)
             .field("validator_id", &self.validator_id)
-            .field("key_ring", &self.key_ring)
+            .field("key_ring", &key_ring)
             .finish()
     }
 }
@@ -242,6 +312,17 @@ impl fmt::Debug for PrivateTxPayloadDecryptor {
 struct SubmissionKeyRing {
     current: SubmissionKeySlot,
     draining: Vec<SubmissionKeySlot>,
+}
+
+struct PendingSubmissionKeyRotation {
+    next: SubmissionKeySlot,
+    destroy_previous_at: BlockNumber,
+}
+
+impl PendingSubmissionKeyRotation {
+    fn descriptor(&self) -> &PrivateValidatorDescriptor {
+        &self.next.descriptor
+    }
 }
 
 impl SubmissionKeyRing {
@@ -269,36 +350,39 @@ impl SubmissionKeyRing {
         &self.current.descriptor
     }
 
-    fn unsealing_key(&self, encryption_key_id: Word) -> Option<&UnsealingKey> {
+    fn unsealing_key(
+        &self,
+        encryption_key_id: Word,
+        current_block: BlockNumber,
+    ) -> Option<&UnsealingKey> {
         self.current
             .matches(encryption_key_id)
-            .then_some(&self.current.unsealing_key)
+            .then_some(&self.current)
+            .filter(|slot| slot.is_active(current_block))
+            .map(|slot| &slot.unsealing_key)
             .or_else(|| {
                 self.draining
                     .iter()
-                    .find(|slot| slot.matches(encryption_key_id))
+                    .find(|slot| slot.matches(encryption_key_id) && slot.is_active(current_block))
                     .map(|slot| &slot.unsealing_key)
             })
     }
 
-    #[cfg(test)]
-    fn rotate_for_test(
+    fn rotate(
         &mut self,
-        next_unsealing_key: UnsealingKey,
-        valid_from: BlockNumber,
-        valid_until: BlockNumber,
+        next: SubmissionKeySlot,
         destroy_previous_at: BlockNumber,
-    ) -> Word {
-        let chain_id = self.current.descriptor.chain_id.clone();
-        let validator_id = self.current.descriptor.validator_id.clone();
-        let next = SubmissionKeySlot::new(
-            chain_id,
-            validator_id,
-            next_unsealing_key,
-            valid_from,
-            valid_until,
-            None,
-        );
+        current_block: BlockNumber,
+    ) -> tonic::Result<PrivateValidatorDescriptor> {
+        validate_rotation_window(
+            next.descriptor.valid_from,
+            next.descriptor.valid_until,
+            destroy_previous_at,
+        )?;
+        self.prune_destroyed(current_block);
+
+        let valid_from = next.descriptor.valid_from;
+        let valid_until = next.descriptor.valid_until;
         let mut previous = std::mem::replace(&mut self.current, next);
         // `destroy_at` is the first block at which the key is no longer accepted.
         // Descriptors use an inclusive `valid_until`, so a demoted key must advertise
@@ -307,16 +391,59 @@ impl SubmissionKeyRing {
             previous.descriptor.valid_until.min(destroy_previous_at.saturating_sub(1));
         previous.destroy_at = Some(destroy_previous_at);
         let current_key_id = self.current.descriptor.encryption_key_id;
+        let current_descriptor = self.current.descriptor.clone();
         self.draining.push(previous);
+        self.prune_destroyed(current_block);
 
-        current_key_id
+        tracing::info!(
+            target: COMPONENT,
+            %current_key_id,
+            %valid_from,
+            %valid_until,
+            %destroy_previous_at,
+            "rotated private transaction submission key"
+        );
+
+        Ok(current_descriptor)
     }
 
-    #[cfg(test)]
-    fn retire_drained_keys_for_test(&mut self, current_block: BlockNumber) {
-        self.draining
-            .retain(|slot| slot.destroy_at.is_none_or(|destroy_at| current_block < destroy_at));
+    fn prune_destroyed(&mut self, current_block: BlockNumber) {
+        let before = self.draining.len();
+        self.draining.retain(|slot| !slot.is_prunable(current_block));
+        let pruned = before - self.draining.len();
+        if pruned > 0 {
+            tracing::debug!(
+                target: COMPONENT,
+                %current_block,
+                pruned,
+                "pruned destroyed private transaction submission keys"
+            );
+        }
     }
+}
+
+fn validate_rotation_window(
+    valid_from: BlockNumber,
+    valid_until: BlockNumber,
+    destroy_previous_at: BlockNumber,
+) -> tonic::Result<()> {
+    if valid_from > valid_until {
+        return Err(Status::invalid_argument(
+            "submission key valid_from must be less than or equal to valid_until",
+        ));
+    }
+    if destroy_previous_at == BlockNumber::GENESIS {
+        return Err(Status::invalid_argument(
+            "submission key destroy_previous_at must be greater than genesis",
+        ));
+    }
+    if destroy_previous_at < valid_from {
+        return Err(Status::invalid_argument(
+            "submission key destroy_previous_at must be greater than or equal to valid_from",
+        ));
+    }
+
+    Ok(())
 }
 
 impl fmt::Debug for SubmissionKeyRing {
@@ -362,6 +489,17 @@ impl SubmissionKeySlot {
 
     fn matches(&self, encryption_key_id: Word) -> bool {
         self.descriptor.encryption_key_id == encryption_key_id
+    }
+
+    fn is_active(&self, current_block: BlockNumber) -> bool {
+        self.descriptor.valid_from <= current_block
+            && current_block <= self.descriptor.valid_until
+            && self.destroy_at.is_none_or(|destroy_at| current_block < destroy_at)
+    }
+
+    fn is_prunable(&self, current_block: BlockNumber) -> bool {
+        current_block > self.descriptor.valid_until
+            || self.destroy_at.is_some_and(|destroy_at| current_block >= destroy_at)
     }
 }
 
@@ -464,6 +602,9 @@ struct ValidatorServer {
     /// Serializes `sign_block` requests so that concurrent calls are processed sequentially,
     /// ensuring consistent chain tip reads and preventing race conditions.
     sign_block_semaphore: Semaphore,
+    /// Serializes manual submission-key rotations so the signed descriptor returned to the caller
+    /// is the descriptor installed as current.
+    submission_key_rotation_semaphore: Semaphore,
     /// In-memory chain tip, updated atomically after each signed block.
     chain_tip: AtomicU32,
     /// In-memory count of validated transactions, incremented after each new insert.
@@ -487,10 +628,23 @@ impl ValidatorServer {
             signer,
             db: db.into(),
             sign_block_semaphore: Semaphore::new(1),
+            submission_key_rotation_semaphore: Semaphore::new(1),
             chain_tip: AtomicU32::new(initial_chain_tip),
             validated_transactions_count: AtomicU64::new(initial_tx_count),
             signed_blocks_count: AtomicU64::new(initial_block_count),
             private_tx_submission: private_tx_submission.into(),
         }
+    }
+
+    async fn sign_submission_key_descriptor(
+        &self,
+        descriptor: PrivateValidatorDescriptor,
+    ) -> tonic::Result<SignedSubmissionKey> {
+        let commitment = submission_key_commitment(&descriptor);
+        let signature = self.signer.sign_commitment(commitment).await.map_err(|err| {
+            tonic::Status::internal(format!("Failed to sign submission key: {err}"))
+        })?;
+
+        Ok(SignedSubmissionKey::new(descriptor, signature))
     }
 }

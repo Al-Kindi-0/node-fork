@@ -12,7 +12,7 @@ use miden_protocol::testing::random_secret_key::random_secret_key;
 use miden_protocol::transaction::PartialBlockchain;
 use miden_tx::utils::serde::Serializable;
 
-use super::{PrivateTxSubmissionConfig, SubmissionKeyRing, ValidatorServer};
+use super::{PrivateTxSubmissionConfig, SubmissionKeyRing, SubmissionKeySlot, ValidatorServer};
 use crate::ValidatorSigner;
 use crate::db::{load, load_chain_tip, upsert_block_header};
 
@@ -147,16 +147,70 @@ fn rotation_clamps_draining_descriptor_validity_to_destroy_block() {
         BlockNumber::MAX,
     );
 
-    ring.rotate_for_test(
-        UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
-        BlockNumber::from(10),
-        BlockNumber::MAX,
+    ring.rotate(
+        SubmissionKeySlot::new(
+            ChainId::new("miden-devnet").unwrap(),
+            ValidatorId::new("validator-1").unwrap(),
+            UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
+            BlockNumber::from(10),
+            BlockNumber::MAX,
+            None,
+        ),
         BlockNumber::from(30),
-    );
+        BlockNumber::from(10),
+    )
+    .unwrap();
 
     let draining = ring.draining.first().expect("previous key should be draining");
     assert_eq!(draining.destroy_at, Some(BlockNumber::from(30)));
     assert_eq!(draining.descriptor.valid_until, BlockNumber::from(29));
+}
+
+#[test]
+fn rotation_prunes_destroyed_draining_keys() {
+    let chain_id = ChainId::new("miden-devnet").unwrap();
+    let validator_id = ValidatorId::new("validator-1").unwrap();
+    let mut ring = SubmissionKeyRing::single(
+        chain_id.clone(),
+        validator_id.clone(),
+        UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
+        BlockNumber::GENESIS,
+        BlockNumber::MAX,
+    );
+    let first_key_id = ring.current_descriptor().encryption_key_id;
+
+    ring.rotate(
+        SubmissionKeySlot::new(
+            chain_id.clone(),
+            validator_id.clone(),
+            UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
+            BlockNumber::from(10),
+            BlockNumber::MAX,
+            None,
+        ),
+        BlockNumber::from(20),
+        BlockNumber::from(10),
+    )
+    .unwrap();
+    assert_eq!(ring.draining.len(), 1);
+    assert_eq!(ring.draining[0].descriptor.encryption_key_id, first_key_id);
+
+    ring.rotate(
+        SubmissionKeySlot::new(
+            chain_id,
+            validator_id,
+            UnsealingKey::X25519XChaCha20Poly1305(X25519SecretKey::new()),
+            BlockNumber::from(20),
+            BlockNumber::MAX,
+            None,
+        ),
+        BlockNumber::from(30),
+        BlockNumber::from(20),
+    )
+    .unwrap();
+
+    assert_eq!(ring.draining.len(), 1);
+    assert_ne!(ring.draining[0].descriptor.encryption_key_id, first_key_id);
 }
 
 /// A replacement block at the same height as the current chain tip should be accepted.
