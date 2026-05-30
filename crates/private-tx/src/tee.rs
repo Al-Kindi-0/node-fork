@@ -17,6 +17,16 @@ pub struct AttestationEvidence {
     pub evidence: Vec<u8>,
 }
 
+impl AttestationEvidence {
+    /// Empty evidence for configurations without a TEE attestation backend.
+    pub fn none() -> Self {
+        Self {
+            tee_scheme_id: TeeSchemeId::new(0),
+            evidence: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnclaveIdentity {
     pub tee_scheme_id: TeeSchemeId,

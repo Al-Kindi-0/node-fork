@@ -20,6 +20,7 @@ use miden_node_private_tx::{
     archive_associated_data_for_record, decrypt_submission_payload, encrypt_submission_payload,
     open_private_tx_record, private_tx_record_identity, seal_private_tx_record,
     submission_associated_data_for_encryption, submission_associated_data_for_payload,
+    submission_key_id,
 };
 use miden_node_private_tx_golden::{
     GOLDEN_THRESHOLD_SCHEME_ID, GoldenThresholdAdapter, decrypt_private_tx_archive_record,
@@ -837,6 +838,7 @@ impl Fixture {
         let validator_secret_key = SecretKey::new();
         let validator_public_key = validator_secret_key.public_key();
         let validator_public_key_bytes = validator_public_key.to_bytes();
+        let sealing_key = SealingKey::X25519XChaCha20Poly1305(validator_public_key);
         let mut attestation_bytes = Vec::new();
         attestation_bytes.extend_from_slice(b"demo-attestation");
         attestation_bytes.extend_from_slice(&validator_public_key_bytes);
@@ -845,10 +847,10 @@ impl Fixture {
             chain_id: ChainId::new("miden-devnet")?,
             tx_id: tx_id(100)?,
             validator_id: ValidatorId::new("validator-1")?,
-            validator_encryption_key_id: word(20),
+            validator_encryption_key_id: submission_key_id(&sealing_key),
             tee_attestation_id: Hasher::hash(&attestation_bytes),
             public_tx_hash: Hasher::hash(b"demo-public-proven-transaction"),
-            sealing_key: SealingKey::X25519XChaCha20Poly1305(validator_public_key),
+            sealing_key,
             unsealing_key: UnsealingKey::X25519XChaCha20Poly1305(validator_secret_key),
             viewing_policy: ViewingPolicy {
                 version: PRIVATE_TX_VERSION,

@@ -29,6 +29,8 @@ The PoC proves the architecture end to end with real crypto:
 - RPC accepts encrypted private payloads in private mode (`--rpc.private-tx.enabled`) and forwards
   them opaquely; the validator owns decryption.
 - Validator private mode loads an unsealing key and viewing group public key from config.
+- The validator exposes a signed submission-key descriptor containing the encryption key, key ID,
+  validator ID, chain ID, and block-height validity window.
 - The validator stores encrypted archive records in SQLite.
 - `GetPrivateTxArchiveRecord` returns a serialized `EncryptedPrivateTxRecord` by transaction ID.
 - `decrypt_private_tx_archive_record` runs the in-process audit ceremony and opens the archive.
@@ -50,8 +52,11 @@ The PoC proves the architecture end to end with real crypto:
 - No production binary launches the RPC server today; private-mode RPC behavior is verified at the
   handler level. A full RPC-to-validator submission test still needs a real proven transaction
   fixture or a proof-verification test seam.
-- Validator encryption-key discovery is manual/config-file based. Production needs an authenticated
-  discovery mechanism, such as an on-chain registry or signed metadata.
+- Submission-key discovery is validator-direct in the PoC. Production may serve the same signed
+  descriptor through RPC caches, and should anchor the validator signing key to the on-chain
+  validator identity.
+- Submission-key descriptors use an open-ended `genesis..max` block validity window in the PoC.
+  Production should publish real validity windows per rotation epoch.
 - DKG setup in tests and the demo uses local helper code for a 3-party, threshold-2 group. A
   long-lived test suite should extract a shared golden fixture.
 - `miden-node-private-tx-golden` is a runtime validator dependency because private mode constructs
@@ -123,10 +128,11 @@ cargo run -p miden-node-private-tx-golden --example private_validator_tui -- --o
 cargo run -p miden-node-private-tx-golden --example private_validator_tui -- --below-threshold
 ```
 
-Use a terminal at least 132x40. The TUI shows the same private fields as cleartext for the
-client/validator/auditor and as sealed values for the RPC operator. The sidebar tracks who holds
-secrets, what is public or opaque, measured timings, and mock party bonds. Scenario switching
-re-renders one real happy-path crypto run; it does not re-run the ceremony for each scenario.
+Use a terminal at least 132x40. The TUI starts with signed submission-key discovery, then shows the
+same private fields as cleartext for the client/validator/auditor and as sealed values for the RPC
+operator. The sidebar tracks who holds secrets, what is public or opaque, measured timings, and mock
+party bonds. Scenario switching re-renders one real happy-path crypto run; it does not re-run the
+ceremony for each scenario.
 
 Run the scriptable demo for compact metrics:
 

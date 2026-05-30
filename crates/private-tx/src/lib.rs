@@ -10,6 +10,7 @@ pub mod audit_coordination;
 pub mod encryption;
 pub mod envelope;
 pub mod mock;
+pub mod submission_key;
 pub mod tee;
 pub mod threshold;
 pub mod types;
@@ -34,6 +35,10 @@ pub use encryption::{
 pub use envelope::{
     DataKeyProtection, EncryptedPrivateTxPayload, EncryptedPrivateTxRecord, PrivateTxRecord,
     PrivateTxRecordMetadata, PrivateValidatorDescriptor, ViewingPolicy,
+};
+pub use submission_key::{
+    SignedSubmissionKey, SubmissionKeyVerificationError, submission_key_commitment,
+    submission_key_id, verify_signed_submission_key,
 };
 pub use tee::{
     AttestationEvidence, AttestationVerifier, Attestor, EnclaveIdentity, TeeError, TeeKeyProvider,

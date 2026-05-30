@@ -16,15 +16,19 @@ use crossterm::terminal::{
 use miden_node_private_tx::{
     ArchiveAssociatedData, ArchiveRecordKey, ChainId, EncryptedPrivateTxPayload,
     EncryptedPrivateTxRecord, PRIVATE_TX_VERSION, PrivateTxRecord, PrivateTxRecordMetadata,
-    SubmissionEncryptionAssociatedData, SubmissionPayloadAssociatedData, ThresholdRecordEncryptor,
-    ValidatorId, ViewingGroupPublicKey, ViewingGroupSetup, ViewingKeyShare, ViewingPartyId,
-    ViewingPartyPublicShare, ViewingPolicy, archive_associated_data, decrypt_submission_payload,
-    encrypt_submission_payload, private_tx_record_identity, seal_private_tx_record,
-    submission_associated_data_for_encryption, submission_associated_data_for_payload,
+    PrivateValidatorDescriptor, SignedSubmissionKey, SubmissionEncryptionAssociatedData,
+    SubmissionPayloadAssociatedData, ThresholdRecordEncryptor, ValidatorId, ViewingGroupPublicKey,
+    ViewingGroupSetup, ViewingKeyShare, ViewingPartyId, ViewingPartyPublicShare, ViewingPolicy,
+    archive_associated_data, decrypt_submission_payload, encrypt_submission_payload,
+    private_tx_record_identity, seal_private_tx_record, submission_associated_data_for_encryption,
+    submission_associated_data_for_payload, submission_key_commitment, submission_key_id,
+    verify_signed_submission_key,
 };
 use miden_node_private_tx_golden::{
     GOLDEN_THRESHOLD_SCHEME_ID, GoldenThresholdAdapter, decrypt_private_tx_archive_record,
 };
+use miden_protocol::block::BlockNumber;
+use miden_protocol::crypto::dsa::ecdsa_k256_keccak::SecretKey as ValidatorSigningKey;
 use miden_protocol::crypto::dsa::eddsa_25519_sha512::SecretKey;
 use miden_protocol::crypto::ies::{SealingKey, UnsealingKey};
 use miden_protocol::transaction::TransactionId;
@@ -44,7 +48,7 @@ const SLASH_AMOUNT: u64 = 10;
 const MIN_TERMINAL_WIDTH: u16 = 132;
 const MIN_TERMINAL_HEIGHT: u16 = 40;
 const SIDEBAR_WIDTH: u16 = 34;
-const TOP_ROW_HEIGHT: u16 = 13;
+const TOP_ROW_HEIGHT: u16 = 16;
 
 type DemoResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -102,6 +106,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
+    Discovery,
     Setup,
     ClientSeal,
     ValidatorArchive,
@@ -111,7 +116,8 @@ enum Stage {
 }
 
 impl Stage {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
+        Self::Discovery,
         Self::Setup,
         Self::ClientSeal,
         Self::ValidatorArchive,
@@ -122,17 +128,21 @@ impl Stage {
 
     const fn title(self) -> &'static str {
         match self {
-            Self::Setup => "1. Viewing group",
-            Self::ClientSeal => "2. Client seals payload",
-            Self::ValidatorArchive => "3. Validator archives",
-            Self::AuditRequest => "4. Auditor requests tx",
-            Self::AuditRecover => "5. Threshold unlock",
-            Self::Coordination => "6. Coordination outcome",
+            Self::Discovery => "1. Discover validator key",
+            Self::Setup => "2. Viewing group",
+            Self::ClientSeal => "3. Client seals payload",
+            Self::ValidatorArchive => "4. Validator archives",
+            Self::AuditRequest => "5. Auditor requests tx",
+            Self::AuditRecover => "6. Threshold unlock",
+            Self::Coordination => "7. Coordination outcome",
         }
     }
 
     const fn narrative(self) -> &'static str {
         match self {
+            Self::Discovery => {
+                "The client fetches a validator-signed submission key before encrypting."
+            },
             Self::Setup => {
                 "Viewing parties create a threshold key before any private transaction is archived."
             },
@@ -154,12 +164,13 @@ impl Stage {
 
     const fn index(self) -> usize {
         match self {
-            Self::Setup => 0,
-            Self::ClientSeal => 1,
-            Self::ValidatorArchive => 2,
-            Self::AuditRequest => 3,
-            Self::AuditRecover => 4,
-            Self::Coordination => 5,
+            Self::Discovery => 0,
+            Self::Setup => 1,
+            Self::ClientSeal => 2,
+            Self::ValidatorArchive => 3,
+            Self::AuditRequest => 4,
+            Self::AuditRecover => 5,
+            Self::Coordination => 6,
         }
     }
 }
@@ -213,7 +224,11 @@ impl App {
             Some(other) => return Err(format!("unknown argument: {other}").into()),
         };
 
-        Ok(Self { snapshot, stage: Stage::Setup, scenario })
+        Ok(Self {
+            snapshot,
+            stage: Stage::Discovery,
+            scenario,
+        })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -221,7 +236,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') => self.next_stage(),
             KeyCode::Left | KeyCode::Up => self.previous_stage(),
-            KeyCode::Char('r') => self.stage = Stage::Setup,
+            KeyCode::Char('r') => self.stage = Stage::Discovery,
             KeyCode::Char('1') => self.scenario = Scenario::AllRespond,
             KeyCode::Char('2') => self.scenario = Scenario::OneMissing,
             KeyCode::Char('3') => self.scenario = Scenario::BelowThreshold,
@@ -255,6 +270,7 @@ impl App {
 
     const fn active_pane(&self, pane: Pane) -> bool {
         match self.stage {
+            Stage::Discovery => matches!(pane, Pane::Client),
             Stage::Setup => false,
             Stage::ClientSeal => matches!(pane, Pane::Client),
             Stage::ValidatorArchive => matches!(pane, Pane::Validator),
@@ -279,6 +295,8 @@ fn print_help() {
 
 struct DemoSnapshot {
     tx_id: String,
+    submission_key_id: String,
+    discovery_blob_bytes: usize,
     participants: usize,
     threshold: u16,
     private_fields: PrivateFields,
@@ -404,6 +422,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_client(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines = vec![
+        Line::from("Submission key discovery:"),
+        status_line("signed descriptor", "verified", Color::Green),
+        label_value("key id", app.snapshot.submission_key_id.clone()),
+        label_value("validity", "genesis..max block"),
+        Line::from(""),
         Line::from("Private fields, client view:"),
         private_field("note", app.snapshot.private_fields.note.clone(), Color::White),
         private_field("amount", app.snapshot.private_fields.amount.clone(), Color::White),
@@ -416,6 +439,8 @@ fn render_client(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(status_line("encrypted payload", "sealed", Color::Green));
         lines.push(label_value("payload bytes", app.snapshot.submission_payload_bytes.to_string()));
         lines.push(label_value("binding", "chain + tx + validator + key id"));
+    } else if app.stage_reached(Stage::Discovery) {
+        lines.push(status_line("ready to encrypt", "yes", Color::Green));
     } else {
         lines.push(status_line("waiting to submit", "not sealed yet", Color::Gray));
     }
@@ -446,6 +471,11 @@ fn render_rpc(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(label_value("sees", "ProvenTransaction + opaque blob"));
         lines.push(status_line("can decrypt", "no", Color::Green));
     } else {
+        lines.push(label_value(
+            "serves",
+            format!("signed key descriptor ({} B)", app.snapshot.discovery_blob_bytes),
+        ));
+        lines.push(status_line("can swap key", "no signature", Color::Green));
         lines.push(status_line("transaction", "not submitted", Color::Gray));
     }
 
@@ -488,6 +518,12 @@ fn render_validator(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Line::from(""),
             status_line("received encrypted payload", "waiting", Color::Yellow),
             private_field("note", "[sealed until validator opens]", Color::Gray),
+        ]);
+    } else if app.stage_reached(Stage::Discovery) {
+        lines.extend([
+            Line::from(""),
+            status_line("published submission key", "signed", Color::Green),
+            label_value("key id", app.snapshot.submission_key_id.clone()),
         ]);
     } else {
         lines.extend([Line::from(""), status_line("validator", "idle", Color::Gray)]);
@@ -568,7 +604,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let sidebar = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Length(6),
             Constraint::Min(10),
             Constraint::Min(8),
@@ -781,6 +817,7 @@ fn secrets_public_lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         label_value("proof", "ProvenTransaction"),
+        label_value("submission key", "signed descriptor"),
     ]);
 
     if app.stage_reached(Stage::ClientSeal) {
@@ -893,8 +930,14 @@ fn build_demo_snapshot() -> DemoResult<DemoSnapshot> {
     let viewing_group = ViewingGroup::setup(&adapter, &fixture.viewing_policy)?;
     let dkg_ms = dkg_started.elapsed().as_millis();
 
+    let signed_submission_key = signed_submission_key(&fixture)?;
+    let discovered_key =
+        SealingKey::read_from_bytes(&signed_submission_key.descriptor.encryption_public_key)?;
+    let discovered_key_id = signed_submission_key.descriptor.encryption_key_id;
+
     let client_started = Instant::now();
-    let wire_payload = client_encrypts_private_payload(&fixture)?;
+    let wire_payload =
+        client_encrypts_private_payload(&fixture, &discovered_key, discovered_key_id)?;
     let client_encrypt_ms = client_started.elapsed().as_millis();
 
     let validator_started = Instant::now();
@@ -919,6 +962,8 @@ fn build_demo_snapshot() -> DemoResult<DemoSnapshot> {
 
     Ok(DemoSnapshot {
         tx_id: short_id(&fixture.tx_id.to_string()),
+        submission_key_id: short_id(&discovered_key_id.to_string()),
+        discovery_blob_bytes: signed_submission_key.to_bytes().len(),
         participants: viewing_group.key_shares.len(),
         threshold: viewing_group.threshold,
         private_fields: parse_private_fields(audit.record.transaction_inputs())?,
@@ -985,6 +1030,7 @@ impl Fixture {
         let validator_secret_key = SecretKey::new();
         let validator_public_key = validator_secret_key.public_key();
         let validator_public_key_bytes = validator_public_key.to_bytes();
+        let sealing_key = SealingKey::X25519XChaCha20Poly1305(validator_public_key);
         let mut attestation_bytes = Vec::new();
         attestation_bytes.extend_from_slice(b"demo-attestation");
         attestation_bytes.extend_from_slice(&validator_public_key_bytes);
@@ -993,10 +1039,10 @@ impl Fixture {
             chain_id: ChainId::new("miden-devnet")?,
             tx_id: tx_id(100)?,
             validator_id: ValidatorId::new("validator-1")?,
-            validator_encryption_key_id: word(20),
+            validator_encryption_key_id: submission_key_id(&sealing_key),
             tee_attestation_id: Hasher::hash(&attestation_bytes),
             public_tx_hash: Hasher::hash(b"demo-public-proven-transaction"),
-            sealing_key: SealingKey::X25519XChaCha20Poly1305(validator_public_key),
+            sealing_key,
             unsealing_key: UnsealingKey::X25519XChaCha20Poly1305(validator_secret_key),
             viewing_policy: ViewingPolicy {
                 version: PRIVATE_TX_VERSION,
@@ -1011,6 +1057,32 @@ impl Fixture {
             },
         })
     }
+}
+
+fn signed_submission_key(fixture: &Fixture) -> DemoResult<SignedSubmissionKey> {
+    let signer = ValidatorSigningKey::new();
+    let descriptor = PrivateValidatorDescriptor {
+        version: PRIVATE_TX_VERSION,
+        chain_id: fixture.chain_id.clone(),
+        validator_id: fixture.validator_id.clone(),
+        encryption_key_id: fixture.validator_encryption_key_id,
+        encryption_public_key: fixture.sealing_key.to_bytes(),
+        attestation_evidence: miden_node_private_tx::AttestationEvidence::none(),
+        valid_from: BlockNumber::GENESIS,
+        valid_until: BlockNumber::MAX,
+    };
+    let signature = signer.sign(submission_key_commitment(&descriptor));
+    let signed_key = SignedSubmissionKey::new(descriptor, signature);
+
+    verify_signed_submission_key(
+        &signed_key,
+        &fixture.chain_id,
+        &fixture.validator_id,
+        BlockNumber::GENESIS,
+        &signer.public_key(),
+    )?;
+
+    Ok(signed_key)
 }
 
 struct ViewingGroup {
@@ -1088,18 +1160,22 @@ struct ArchiveOutput {
     wrapped_key_bytes: usize,
 }
 
-fn client_encrypts_private_payload(fixture: &Fixture) -> DemoResult<Vec<u8>> {
+fn client_encrypts_private_payload(
+    fixture: &Fixture,
+    sealing_key: &SealingKey,
+    validator_encryption_key_id: Word,
+) -> DemoResult<Vec<u8>> {
     let submission_ad =
         submission_associated_data_for_encryption(SubmissionEncryptionAssociatedData {
             chain_id: &fixture.chain_id,
             tx_id: fixture.tx_id,
             validator_id: &fixture.validator_id,
-            validator_encryption_key_id: fixture.validator_encryption_key_id,
+            validator_encryption_key_id,
         });
 
     Ok(encrypt_submission_payload(
-        &fixture.sealing_key,
-        fixture.validator_encryption_key_id,
+        sealing_key,
+        validator_encryption_key_id,
         private_payload(),
         &submission_ad,
     )?

@@ -1,6 +1,7 @@
 mod kms;
 pub use kms::KmsSigner;
 use miden_node_utils::spawn::spawn_blocking_in_current_span;
+use miden_protocol::Word;
 use miden_protocol::block::BlockHeader;
 use miden_protocol::crypto::dsa::ecdsa_k256_keccak::{PublicKey, SecretKey, Signature};
 
@@ -38,7 +39,14 @@ impl ValidatorSigner {
 
     /// Signs a block header using the configured signer.
     pub async fn sign(&self, header: &BlockHeader) -> anyhow::Result<Signature> {
-        let commitment = header.commitment();
+        self.sign_commitment(header.commitment()).await
+    }
+
+    /// Signs a domain-separated commitment using the configured signer.
+    ///
+    /// Callers that sign anything other than a block header must domain-separate the bytes they
+    /// hash into the commitment to avoid cross-protocol signature confusion.
+    pub async fn sign_commitment(&self, commitment: Word) -> anyhow::Result<Signature> {
         let signature = match self {
             Self::Kms(signer) => signer.sign(commitment).await?,
             Self::Local(signer) => spawn_blocking_in_current_span({

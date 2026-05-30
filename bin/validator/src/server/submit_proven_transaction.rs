@@ -155,6 +155,15 @@ impl PrivateTxPayloadDecryptor {
     ) -> tonic::Result<DecodedTransactionInputs> {
         let payload = EncryptedPrivateTxPayload::read_from_bytes(encrypted_payload)
             .map_err(|_| Status::invalid_argument("Invalid encrypted private payload"))?;
+        if payload.validator_encryption_key_id != self.encryption_key_id {
+            tracing::debug!(
+                target: crate::COMPONENT,
+                expected_key_id = %self.encryption_key_id,
+                received_key_id = %payload.validator_encryption_key_id,
+                "rejected encrypted private payload for inactive submission key"
+            );
+            return Err(Status::invalid_argument("Invalid encrypted private payload"));
+        }
         let associated_data =
             submission_associated_data_for_payload(SubmissionPayloadAssociatedData {
                 chain_id: &self.chain_id,
@@ -285,7 +294,7 @@ mod tests {
         ThresholdShareVerifier, ValidatorId, ViewingKeyShare, ViewingPartyId,
         ViewingPartyPublicShare, ViewingPolicy, archive_associated_data_for_record,
         encrypt_submission_payload, open_private_tx_record, private_tx_record_identity,
-        submission_associated_data_for_encryption,
+        submission_associated_data_for_encryption, submission_key_id,
     };
     use miden_protocol::account::{Account, AccountCode, AccountStorage};
     use miden_protocol::asset::AssetVault;
@@ -300,8 +309,7 @@ mod tests {
     use miden_protocol::{Hasher, ONE, Word};
 
     use crate::server::{
-        PrivateTxArchiveConfig, PrivateTxSubmissionConfig, PrivateTxSubmissionMode,
-        ValidatorServer,
+        PrivateTxArchiveConfig, PrivateTxSubmissionConfig, PrivateTxSubmissionMode, ValidatorServer,
     };
     use miden_node_proto::generated as grpc;
 
@@ -385,9 +393,9 @@ mod tests {
         let chain_id = ChainId::new("miden-devnet").unwrap();
         let validator_id = ValidatorId::new("validator-1").unwrap();
         let tx_id = tx_id(9);
-        let validator_encryption_key_id = word(30);
         let secret_key = SecretKey::new();
         let sealing_key = SealingKey::X25519XChaCha20Poly1305(secret_key.public_key());
+        let validator_encryption_key_id = submission_key_id(&sealing_key);
         let unsealing_key = UnsealingKey::X25519XChaCha20Poly1305(secret_key);
         let expected = transaction_inputs();
         let associated_data =
@@ -418,6 +426,46 @@ mod tests {
         let archive_source = actual.archive_source.expect("encrypted inputs should be archived");
         assert_eq!(archive_source.validator_encryption_key_id, validator_encryption_key_id);
         assert_eq!(archive_source.plaintext_transaction_inputs, expected.to_bytes());
+    }
+
+    #[test]
+    fn private_mode_rejects_payload_for_other_submission_key() {
+        let chain_id = ChainId::new("miden-devnet").unwrap();
+        let validator_id = ValidatorId::new("validator-1").unwrap();
+        let tx_id = tx_id(10);
+        let secret_key = SecretKey::new();
+        let sealing_key = SealingKey::X25519XChaCha20Poly1305(secret_key.public_key());
+        let unsealing_key = UnsealingKey::X25519XChaCha20Poly1305(secret_key);
+        let payload_key_id = Word::from([99u32, 98, 97, 96]);
+        let associated_data =
+            submission_associated_data_for_encryption(SubmissionEncryptionAssociatedData {
+                chain_id: &chain_id,
+                tx_id,
+                validator_id: &validator_id,
+                validator_encryption_key_id: payload_key_id,
+            });
+        let payload = encrypt_submission_payload(
+            &sealing_key,
+            payload_key_id,
+            &transaction_inputs().to_bytes(),
+            &associated_data,
+        )
+        .unwrap();
+        let input = super::SubmittedTransactionInputs::Encrypted(payload.to_bytes());
+        let mode = PrivateTxSubmissionMode::from(PrivateTxSubmissionConfig::Private {
+            chain_id,
+            validator_id,
+            unsealing_key,
+            archive: private_tx_archive_config(&mock_viewing_group()),
+        });
+
+        let err = match input.into_transaction_inputs(&mode, tx_id) {
+            Ok(_) => panic!("payload for a different submission key should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Invalid encrypted private payload"));
     }
 
     #[test]

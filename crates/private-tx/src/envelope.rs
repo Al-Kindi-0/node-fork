@@ -10,14 +10,27 @@ use miden_protocol::utils::serde::{
 use crate::tee::AttestationEvidence;
 use crate::types::{ChainId, EncryptionSchemeId, ThresholdSchemeId, ValidatorId, ViewingPartyId};
 
+/// Public submission-key descriptor served by a validator.
+///
+/// Clients verify the validator signature over this descriptor before encrypting private
+/// transaction inputs to `encryption_public_key`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateValidatorDescriptor {
+    /// Descriptor wire-format version.
     pub version: u16,
+    /// Chain this descriptor is valid for.
+    pub chain_id: ChainId,
+    /// Validator that controls the matching private submission key.
     pub validator_id: ValidatorId,
+    /// Hash-derived identifier of `encryption_public_key`.
     pub encryption_key_id: Word,
+    /// Serialized [`SealingKey`](miden_protocol::crypto::ies::SealingKey).
     pub encryption_public_key: Vec<u8>,
+    /// TEE evidence binding the key to an enclave. Empty in the PoC.
     pub attestation_evidence: AttestationEvidence,
+    /// First block number for which clients may use this key.
     pub valid_from: BlockNumber,
+    /// Last block number for which clients may use this key.
     pub valid_until: BlockNumber,
 }
 
@@ -122,6 +135,7 @@ pub struct ViewingPolicy {
 impl Serializable for PrivateValidatorDescriptor {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         target.write_u16(self.version);
+        self.chain_id.write_into(target);
         self.validator_id.write_into(target);
         self.encryption_key_id.write_into(target);
         self.encryption_public_key.write_into(target);
@@ -135,6 +149,7 @@ impl Deserializable for PrivateValidatorDescriptor {
     fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
         Ok(Self {
             version: source.read()?,
+            chain_id: source.read()?,
             validator_id: source.read()?,
             encryption_key_id: source.read()?,
             encryption_public_key: source.read()?,

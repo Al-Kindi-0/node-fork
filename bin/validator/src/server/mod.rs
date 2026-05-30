@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use anyhow::Context;
 use miden_node_db::Db;
 use miden_node_private_tx::{
-    ChainId, ThresholdRecordEncryptor, ValidatorId, ViewingGroupPublicKey,
+    AttestationEvidence, ChainId, PRIVATE_TX_VERSION, PrivateValidatorDescriptor,
+    ThresholdRecordEncryptor, ValidatorId, ViewingGroupPublicKey, submission_key_id,
 };
 use miden_node_proto::generated::validator::api_server;
 use miden_node_proto_build::validator_api_descriptor;
@@ -16,7 +17,9 @@ use miden_node_utils::clap::GrpcOptionsInternal;
 use miden_node_utils::panic::catch_panic_layer_fn;
 use miden_node_utils::tracing::grpc::grpc_trace_fn;
 use miden_protocol::Word;
-use miden_protocol::crypto::ies::UnsealingKey;
+use miden_protocol::block::BlockNumber;
+use miden_protocol::crypto::ies::{SealingKey, UnsealingKey};
+use miden_protocol::utils::serde::Serializable;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -32,6 +35,7 @@ use crate::{COMPONENT, ValidatorSigner};
 mod tests;
 
 mod get_private_tx_archive_record;
+mod get_submission_key;
 mod sign_block;
 mod status;
 mod submit_proven_transaction;
@@ -183,12 +187,23 @@ impl Default for PrivateTxSubmissionConfig {
 pub(crate) struct PrivateTxPayloadDecryptor {
     chain_id: ChainId,
     validator_id: ValidatorId,
+    encryption_key_id: Word,
     unsealing_key: UnsealingKey,
 }
 
 impl PrivateTxPayloadDecryptor {
-    fn new(chain_id: ChainId, validator_id: ValidatorId, unsealing_key: UnsealingKey) -> Self {
-        Self { chain_id, validator_id, unsealing_key }
+    fn new(
+        chain_id: ChainId,
+        validator_id: ValidatorId,
+        encryption_key_id: Word,
+        unsealing_key: UnsealingKey,
+    ) -> Self {
+        Self {
+            chain_id,
+            validator_id,
+            encryption_key_id,
+            unsealing_key,
+        }
     }
 }
 
@@ -197,6 +212,7 @@ impl fmt::Debug for PrivateTxPayloadDecryptor {
         f.debug_struct("PrivateTxPayloadDecryptor")
             .field("chain_id", &self.chain_id)
             .field("validator_id", &self.validator_id)
+            .field("encryption_key_id", &self.encryption_key_id)
             .field("unsealing_key", &"<redacted>")
             .finish()
     }
@@ -239,6 +255,7 @@ pub(crate) enum PrivateTxSubmissionMode {
     Private {
         decryptor: PrivateTxPayloadDecryptor,
         archive_writer: PrivateTxArchiveWriter,
+        submission_key_descriptor: PrivateValidatorDescriptor,
     },
 }
 
@@ -246,10 +263,15 @@ impl fmt::Debug for PrivateTxSubmissionMode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Public => f.write_str("Public"),
-            Self::Private { decryptor, archive_writer } => f
+            Self::Private {
+                decryptor,
+                archive_writer,
+                submission_key_descriptor,
+            } => f
                 .debug_struct("Private")
                 .field("decryptor", decryptor)
                 .field("archive_writer", archive_writer)
+                .field("submission_key_descriptor", submission_key_descriptor)
                 .finish(),
         }
     }
@@ -264,15 +286,45 @@ impl From<PrivateTxSubmissionConfig> for PrivateTxSubmissionMode {
                 validator_id,
                 unsealing_key,
                 archive,
-            } => Self::Private {
-                decryptor: PrivateTxPayloadDecryptor::new(
-                    chain_id.clone(),
-                    validator_id.clone(),
-                    unsealing_key,
-                ),
-                archive_writer: PrivateTxArchiveWriter::new(chain_id, validator_id, archive),
+            } => {
+                let sealing_key = sealing_key_for_unsealing_key(&unsealing_key);
+                let encryption_key_id = submission_key_id(&sealing_key);
+                let submission_key_descriptor = PrivateValidatorDescriptor {
+                    version: PRIVATE_TX_VERSION,
+                    chain_id: chain_id.clone(),
+                    validator_id: validator_id.clone(),
+                    encryption_key_id,
+                    encryption_public_key: sealing_key.to_bytes(),
+                    attestation_evidence: AttestationEvidence::none(),
+                    valid_from: BlockNumber::GENESIS,
+                    valid_until: BlockNumber::MAX,
+                };
+
+                Self::Private {
+                    decryptor: PrivateTxPayloadDecryptor::new(
+                        chain_id.clone(),
+                        validator_id.clone(),
+                        encryption_key_id,
+                        unsealing_key,
+                    ),
+                    archive_writer: PrivateTxArchiveWriter::new(chain_id, validator_id, archive),
+                    submission_key_descriptor,
+                }
             },
         }
+    }
+}
+
+fn sealing_key_for_unsealing_key(unsealing_key: &UnsealingKey) -> SealingKey {
+    match unsealing_key {
+        UnsealingKey::K256XChaCha20Poly1305(key) => {
+            SealingKey::K256XChaCha20Poly1305(key.public_key())
+        },
+        UnsealingKey::X25519XChaCha20Poly1305(key) => {
+            SealingKey::X25519XChaCha20Poly1305(key.public_key())
+        },
+        UnsealingKey::K256AeadPoseidon2(key) => SealingKey::K256AeadPoseidon2(key.public_key()),
+        UnsealingKey::X25519AeadPoseidon2(key) => SealingKey::X25519AeadPoseidon2(key.public_key()),
     }
 }
 

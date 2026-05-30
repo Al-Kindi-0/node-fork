@@ -18,6 +18,9 @@ service Api {
    // Submits a transaction to the validator.
    rpc SubmitProvenTransaction(transaction.ProvenTransaction) returns (google.protobuf.Empty) {}
 
+   // Returns the signed private-transaction submission key descriptor.
+   rpc GetSubmissionKey(google.protobuf.Empty) returns (PrivateTxSubmissionKey) {}
+
    // Fetches an encrypted private transaction archive record by transaction ID.
    //
    // The returned record is encrypted; access control is enforced by the threshold audit ceremony,
@@ -28,8 +31,14 @@ service Api {
    rpc SignBlock(blockchain.ProposedBlock) returns (blockchain.BlockSignature) {}
 }
 
-// PRIVATE TX ARCHIVE
+// PRIVATE TRANSACTIONS
 // ================================================================================================
+
+// Signed private transaction submission key descriptor.
+message PrivateTxSubmissionKey {
+    // Encoded using [miden_node_private_tx::SignedSubmissionKey::to_bytes].
+    bytes signed_key = 1;
+}
 
 // Request for a private transaction archive record.
 message PrivateTxArchiveRecordRequest {

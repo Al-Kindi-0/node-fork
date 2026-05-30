@@ -27,6 +27,12 @@ pub(super) struct TestValidator {
 impl TestValidator {
     /// Creates a [`ValidatorServer`] bootstrapped with a random genesis block.
     pub(super) async fn new() -> Self {
+        Self::with_private_submission(PrivateTxSubmissionConfig::Public).await
+    }
+
+    pub(super) async fn with_private_submission(
+        private_tx_submission: PrivateTxSubmissionConfig,
+    ) -> Self {
         let signer = ValidatorSigner::new_local(random_secret_key());
 
         let genesis_signer = random_secret_key();
@@ -46,7 +52,7 @@ impl TestValidator {
         .unwrap();
 
         Self {
-            server: ValidatorServer::new(signer, db, 0, 0, 0, PrivateTxSubmissionConfig::Public),
+            server: ValidatorServer::new(signer, db, 0, 0, 0, private_tx_submission),
             chain: PartialBlockchain::default(),
             chain_tip: genesis_header,
         }
@@ -302,10 +308,7 @@ async fn unknown_transactions_rejected() {
     use miden_protocol::block::BlockNumber;
     use miden_protocol::testing::account_id::ACCOUNT_ID_SENDER;
     use miden_protocol::transaction::{
-        InputNoteCommitment,
-        InputNotes,
-        OrderedTransactionHeaders,
-        TransactionHeader,
+        InputNoteCommitment, InputNotes, OrderedTransactionHeaders, TransactionHeader,
     };
 
     use crate::block_validation::{BlockValidationError, validate_block};
